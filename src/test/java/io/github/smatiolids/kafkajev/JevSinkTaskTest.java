@@ -1,6 +1,7 @@
 package io.github.smatiolids.kafkajev;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
@@ -314,31 +315,94 @@ class JevSinkTaskTest {
 
     Map<String, String> required = new java.util.HashMap<>(withDefault);
     required.put("state.template", "trace=${header:trace-id}");
-    JevSinkTask failingTask = new JevSinkTask(ignored -> output());
+    MockProducer<String, String> failingOutput = output();
+    JevSinkTask failingTask = new JevSinkTask(ignored -> failingOutput);
     failingTask.start(required);
-    ConnectException error = assertThrows(ConnectException.class, () -> failingTask.put(List.of(source)));
-    assertEquals("Template header is not valid UTF-8", error.getMessage());
+    failingTask.put(List.of(source));
+    JsonNode deadLetter = JSON.readTree(failingOutput.history().get(0).value());
+    assertEquals("INVALID_UTF8", deadLetter.at("/error/code").asText());
+    assertEquals("Template header is not valid UTF-8", deadLetter.at("/error/message").asText());
+    assertFalse(failingOutput.history().get(0).value().contains("trace-id"));
     failingTask.stop();
   }
 
   @Test
-  void missingRequiredTemplateValuesFailBeforeJevIsCalled() throws Exception {
+  void missingRequiredTemplateValuesPublishASanitizedDeadLetterRecord() throws Exception {
     AtomicReference<JsonNode> receivedRequest = new AtomicReference<>();
     fakeJev = fakeJev(receivedRequest);
     Map<String, String> required = new java.util.HashMap<>(config());
     required.put("state.mode", "TEMPLATE");
     required.put("state.template", "approved=${value:/approved}");
-    JevSinkTask task = new JevSinkTask(ignored -> output());
+    MockProducer<String, String> output = output();
+    JevSinkTask task = new JevSinkTask(ignored -> output);
     task.start(required);
 
-    ConnectException error =
-        assertThrows(
-            ConnectException.class,
-            () -> task.put(List.of(sourceRecord(null, null, null, Map.of("secret", "hidden")))));
+    task.put(List.of(sourceRecord(null, "customer-42", null, Map.of("secret", "hidden"))));
 
-    assertEquals("Required template reference is missing", error.getMessage());
     assertEquals(null, receivedRequest.get());
+    assertEquals(1, output.history().size());
+    var published = output.history().get(0);
+    assertEquals("support-dlq", published.topic());
+    assertEquals(
+        "sha256:7e9d14274c25fe070ce7f8f22a826d69e6285baf36c0741fdfda2771f5ea3c63",
+        published.key());
+    assertEquals(Instant.parse("2026-10-02T13:45:12.345Z").toEpochMilli(), published.timestamp());
+    JsonNode deadLetter = JSON.readTree(published.value());
+    assertEquals("customer-42", deadLetter.at("/source/key").asText());
+    assertEquals("hidden", deadLetter.at("/input/secret").asText());
+    assertEquals("STATE_BUILDING", deadLetter.at("/error/category").asText());
+    assertEquals("MISSING_TEMPLATE_VALUE", deadLetter.at("/error/code").asText());
+    assertEquals("Required template reference is missing", deadLetter.at("/error/message").asText());
+    assertEquals(0, deadLetter.at("/evaluation/attempt_count").asInt());
+    assertEquals("unresolved:jev-latest", deadLetter.at("/evaluation/model/resolved").asText());
+    assertEquals(
+        DeterministicIds.evaluationId(
+            published.key(),
+            deadLetter.at("/evaluation/question_set/hash").asText(),
+            deadLetter.at("/evaluation/state_policy/hash").asText(),
+            "unresolved:jev-latest"),
+        deadLetter.at("/evaluation/id").asText());
+    assertFalse(deadLetter.at("/evaluation").has("state"));
+    assertFalse(deadLetter.has("jev"));
+    assertFalse(published.value().contains("Route it"));
+    assertFalse(published.value().contains("test-key"));
     task.stop();
+  }
+
+  @Test
+  void tombstonesCanBeIgnoredDeadLetteredOrMadeTaskFatal() throws Exception {
+    fakeJev = fakeJev(new AtomicReference<>());
+    SinkRecord tombstone = sourceRecord(null, "customer-42", null, null);
+
+    MockProducer<String, String> ignoredOutput = output();
+    JevSinkTask ignoringTask = new JevSinkTask(ignored -> ignoredOutput);
+    ignoringTask.start(config());
+    ignoringTask.put(List.of(tombstone));
+    assertEquals(0, ignoredOutput.history().size());
+    ignoringTask.stop();
+
+    Map<String, String> dlqConfig = new java.util.HashMap<>(config());
+    dlqConfig.put("behavior.on.null.values", "DLQ");
+    MockProducer<String, String> dlqOutput = output();
+    JevSinkTask dlqTask = new JevSinkTask(ignored -> dlqOutput);
+    dlqTask.start(dlqConfig);
+    dlqTask.put(List.of(tombstone));
+    assertEquals("support-dlq", dlqOutput.history().get(0).topic());
+    JsonNode deadLetter = JSON.readTree(dlqOutput.history().get(0).value());
+    assertEquals("TOMBSTONE", deadLetter.at("/error/code").asText());
+    assertEquals(0, deadLetter.at("/evaluation/attempt_count").asInt());
+    dlqTask.stop();
+
+    Map<String, String> failConfig = new java.util.HashMap<>(config());
+    failConfig.put("behavior.on.null.values", "FAIL");
+    MockProducer<String, String> failedOutput = output();
+    JevSinkTask failingTask = new JevSinkTask(ignored -> failedOutput);
+    failingTask.start(failConfig);
+    ConnectException failure =
+        assertThrows(ConnectException.class, () -> failingTask.put(List.of(tombstone)));
+    assertEquals("Tombstone Source Record configured to fail the task", failure.getMessage());
+    assertEquals(0, failedOutput.history().size());
+    failingTask.stop();
   }
 
   @Test
@@ -380,26 +444,20 @@ class JevSinkTaskTest {
   }
 
   @Test
-  void rejectsRawBytesUnlessUtf8DecodingIsExplicitlyEnabled() throws Exception {
+  void deadLettersUnsupportedOrInvalidRawBytesAndAcceptsValidUtf8() throws Exception {
     AtomicReference<JsonNode> receivedRequest = new AtomicReference<>();
     fakeJev = fakeJev(receivedRequest);
     MockProducer<String, String> rejectedOutput = output();
     JevSinkTask rejectingTask = new JevSinkTask(ignored -> rejectedOutput);
     rejectingTask.start(config());
 
-    ConnectException rejected =
-        assertThrows(
-            ConnectException.class,
-            () ->
-                rejectingTask.put(
-                    List.of(
-                        sourceRecord(
-                            null,
-                            null,
-                            Schema.BYTES_SCHEMA,
-                            "Olá".getBytes(StandardCharsets.UTF_8)))));
-    assertEquals("Raw byte Evaluation State requires state.raw_bytes.encoding=UTF-8", rejected.getMessage());
-    assertEquals(0, rejectedOutput.history().size());
+    rejectingTask.put(
+        List.of(
+            sourceRecord(
+                null, null, Schema.BYTES_SCHEMA, "Olá".getBytes(StandardCharsets.UTF_8))));
+    assertEquals(
+        "RAW_BYTES_DISABLED",
+        JSON.readTree(rejectedOutput.history().get(0).value()).at("/error/code").asText());
     rejectingTask.stop();
 
     MockProducer<String, String> acceptedOutput = output();
@@ -427,15 +485,58 @@ class JevSinkTaskTest {
                 ByteBuffer.wrap("buffer".getBytes(StandardCharsets.UTF_8)))));
     assertEquals("buffer", receivedRequest.get().path("state").asText());
 
-    ConnectException invalidUtf8 =
+    acceptingTask.put(
+        List.of(
+            sourceRecord(null, null, Schema.BYTES_SCHEMA, new byte[] {(byte) 0xc3, 0x28})));
+    JsonNode invalidUtf8 = JSON.readTree(acceptedOutput.history().get(2).value());
+    assertEquals("support-dlq", acceptedOutput.history().get(2).topic());
+    assertEquals("INVALID_UTF8", invalidUtf8.at("/error/code").asText());
+    assertFalse(invalidUtf8.at("/evaluation").has("state"));
+    acceptingTask.stop();
+  }
+
+  @Test
+  void deadLettersEvaluationStateThatExceedsTheConfiguredUtf8ByteLimit() throws Exception {
+    AtomicReference<JsonNode> receivedRequest = new AtomicReference<>();
+    fakeJev = fakeJev(receivedRequest);
+    Map<String, String> limited = new java.util.HashMap<>(config());
+    limited.put("state.mode", "TEMPLATE");
+    limited.put("state.template", "generated=${value}");
+    limited.put("state.max.bytes", "8");
+    MockProducer<String, String> output = output();
+    JevSinkTask task = new JevSinkTask(ignored -> output);
+    task.start(limited);
+
+    task.put(List.of(sourceRecord(null, "customer-42", null, "Olá")));
+
+    assertEquals(null, receivedRequest.get());
+    JsonNode deadLetter = JSON.readTree(output.history().get(0).value());
+    assertEquals("STATE_TOO_LARGE", deadLetter.at("/error/code").asText());
+    assertEquals(
+        DeterministicIds.evaluationStateHash("generated=Olá"),
+        deadLetter.at("/evaluation/state/hash").asText());
+    assertFalse(output.history().get(0).value().contains("generated=Olá"));
+    task.stop();
+  }
+
+  @Test
+  void waitsForDeadLetterPublicationAndFailsTheTaskWhenItFails() throws Exception {
+    fakeJev = fakeJev(new AtomicReference<>());
+    Map<String, String> required = new java.util.HashMap<>(config());
+    required.put("state.mode", "TEMPLATE");
+    required.put("state.template", "approved=${value:/approved}");
+    MockProducer<String, String> output = output();
+    output.sendException = new RuntimeException("broker unavailable");
+    JevSinkTask task = new JevSinkTask(ignored -> output);
+    task.start(required);
+
+    ConnectException failure =
         assertThrows(
             ConnectException.class,
-            () ->
-                acceptingTask.put(
-                    List.of(
-                        sourceRecord(null, null, Schema.BYTES_SCHEMA, new byte[] {(byte) 0xc3, 0x28}))));
-    assertEquals("Raw byte Evaluation State is not valid UTF-8", invalidUtf8.getMessage());
-    acceptingTask.stop();
+            () -> task.put(List.of(sourceRecord(null, null, null, Map.of("safe", true)))));
+
+    assertEquals("Failed to publish Dead-Letter Record", failure.getMessage());
+    task.stop();
   }
 
   @Test

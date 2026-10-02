@@ -22,6 +22,8 @@ final class JevConnectorConfig extends AbstractConfig {
   static final String STATE_MODE = "state.mode";
   static final String STATE_TEMPLATE = "state.template";
   static final String RAW_BYTES_ENCODING = "state.raw_bytes.encoding";
+  static final String STATE_MAX_BYTES = "state.max.bytes";
+  static final String TOMBSTONE_BEHAVIOR = "behavior.on.null.values";
   static final String ENDPOINT = "jev.endpoint";
   static final String ALLOW_HTTP = "jev.allow.insecure.http";
   static final String MODEL = "jev.model";
@@ -58,6 +60,20 @@ final class JevConnectorConfig extends AbstractConfig {
               ConfigDef.ValidString.in("DISABLED", "UTF-8"),
               ConfigDef.Importance.MEDIUM,
               "Raw byte Evaluation State encoding")
+          .define(
+              STATE_MAX_BYTES,
+              ConfigDef.Type.LONG,
+              0L,
+              ConfigDef.Range.atLeast(0L),
+              ConfigDef.Importance.MEDIUM,
+              "Maximum Evaluation State UTF-8 bytes; zero disables the limit")
+          .define(
+              TOMBSTONE_BEHAVIOR,
+              ConfigDef.Type.STRING,
+              "IGNORE",
+              ConfigDef.ValidString.in("IGNORE", "DLQ", "FAIL"),
+              ConfigDef.Importance.MEDIUM,
+              "Tombstone behavior")
           .define(
               ENDPOINT,
               ConfigDef.Type.STRING,
