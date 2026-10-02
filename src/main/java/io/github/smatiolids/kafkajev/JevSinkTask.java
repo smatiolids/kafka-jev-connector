@@ -262,14 +262,14 @@ public final class JevSinkTask extends SinkTask {
     String sourceId = sourceId(sourceRecord);
     String questionSetHash = DeterministicIds.questionSetHash(config.questions());
     String statePolicyHash = statePolicyHash();
-    String requestedModel = config.getString(JevConnectorConfig.MODEL);
-    String unresolvedModel = "unresolved:" + requestedModel;
+    String requestedModel = config.modelReference().value();
+    String failureModel = config.modelReference().failedEvaluationIdentity();
 
     ObjectNode evaluation = CanonicalJson.MAPPER.createObjectNode();
     evaluation.put(
         "id",
         DeterministicIds.evaluationId(
-            sourceId, questionSetHash, statePolicyHash, unresolvedModel));
+            sourceId, questionSetHash, statePolicyHash, failureModel));
     evaluation.set(
         "question_set",
         CanonicalJson.object(
@@ -284,7 +284,7 @@ public final class JevSinkTask extends SinkTask {
           CanonicalJson.object("hash", DeterministicIds.evaluationStateHash(failure.state())));
     }
     evaluation.set(
-        "model", CanonicalJson.object("requested", requestedModel, "resolved", unresolvedModel));
+        "model", CanonicalJson.object("requested", requestedModel, "resolved", failureModel));
     evaluation.put("attempt_count", failure.attemptCount());
     evaluation.put("duration_ms", durationMillis);
     evaluation.put("failed_at", DateTimeFormatter.ISO_INSTANT.format(Instant.now()));
@@ -308,7 +308,7 @@ public final class JevSinkTask extends SinkTask {
             sourceRecord.timestamp(),
             sourceId,
             CanonicalJson.write(deadLetter),
-            provenanceHeaders(evaluation.path("id").asText(), unresolvedModel)),
+            provenanceHeaders(evaluation.path("id").asText(), failureModel)),
         "Dead-Letter Record");
   }
 

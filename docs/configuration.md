@@ -23,7 +23,7 @@ For the initial low-throughput profile, deployment examples set the standard `co
 | --- | --- | --- |
 | `jev.endpoint` | `https://api.typesafe.ai/v1/systemone` | Evaluation endpoint. Redirects are rejected. |
 | `jev.allow.insecure.http` | `false` | Allows HTTP only for explicit local testing. |
-| `jev.model` | `jev-latest` | Requested model alias or versioned ID. Pin a version in production. |
+| `jev.model` | `jev-latest` | Requested model alias or pinned versioned ID. IDs matching `jev-MAJOR.MINOR.PATCH` (with an optional SemVer suffix) are pinned; every other non-empty reference is classified as an alias. Pin a version in production. |
 | `jev.max.in.flight` | `4` | Maximum concurrent Jev requests per task. |
 | `jev.connect.timeout.ms` | `5000` | HTTP connection timeout. |
 | `jev.request.timeout.ms` | `10000` | Timeout for one Evaluation Attempt. |

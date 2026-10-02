@@ -183,6 +183,7 @@ final class JevConnectorConfig extends AbstractConfig {
               "Kafka API secret");
 
   private final CompiledStateTemplate stateTemplate;
+  private final ModelReference modelReference;
 
   JevConnectorConfig(Map<String, ?> properties) {
     super(CONFIG_DEF, properties);
@@ -192,6 +193,7 @@ final class JevConnectorConfig extends AbstractConfig {
     validateEndpoint();
     validateStatePolicy();
     validateKafkaConnection();
+    modelReference = ModelReference.parse(getString(MODEL));
     stateTemplate =
         "TEMPLATE".equals(getString(STATE_MODE))
             ? CompiledStateTemplate.compile(getString(STATE_TEMPLATE))
@@ -200,6 +202,10 @@ final class JevConnectorConfig extends AbstractConfig {
 
   CompiledStateTemplate stateTemplate() {
     return stateTemplate;
+  }
+
+  ModelReference modelReference() {
+    return modelReference;
   }
 
   String stateTemplateForHash() {
@@ -262,6 +268,10 @@ final class JevConnectorConfig extends AbstractConfig {
     }
     if (getPassword(API_KEY) == null || !hasText(getPassword(API_KEY).value())) {
       throw new ConfigException(API_KEY, null, "must be non-empty");
+    }
+    String originalModel = String.valueOf(originals().getOrDefault(MODEL, getString(MODEL)));
+    if (!originalModel.equals(originalModel.strip())) {
+      throw new ConfigException(MODEL, originalModel, "must not have surrounding whitespace");
     }
   }
 

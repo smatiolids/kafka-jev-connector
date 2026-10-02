@@ -522,6 +522,41 @@ class JevSinkTaskTest {
   }
 
   @Test
+  void failedEvaluationUsesPinnedModelIdentityAndOnlyAliasesUseAnUnresolvedSentinel()
+      throws Exception {
+    SinkRecord missing = sourceRecord(null, "customer-42", null, Map.of("secret", "hidden"));
+
+    MockProducer<String, String> aliasOutput = output();
+    JevSinkTask aliasTask = new JevSinkTask(ignored -> aliasOutput);
+    aliasTask.start(requiredTemplateConfig());
+    aliasTask.put(List.of(missing));
+    JsonNode aliasFailure = JSON.readTree(aliasOutput.history().get(0).value());
+    assertEquals("unresolved:jev-latest", aliasFailure.at("/evaluation/model/resolved").asText());
+    aliasTask.stop();
+
+    Map<String, String> pinned = new java.util.HashMap<>(requiredTemplateConfig());
+    pinned.put("jev.model", "jev-1.13.0");
+    MockProducer<String, String> pinnedOutput = output();
+    JevSinkTask pinnedTask = new JevSinkTask(ignored -> pinnedOutput);
+    pinnedTask.start(pinned);
+    pinnedTask.put(List.of(missing));
+    JsonNode pinnedFailure = JSON.readTree(pinnedOutput.history().get(0).value());
+    assertEquals("jev-1.13.0", pinnedFailure.at("/evaluation/model/requested").asText());
+    assertEquals("jev-1.13.0", pinnedFailure.at("/evaluation/model/resolved").asText());
+    assertEquals(
+        DeterministicIds.evaluationId(
+            pinnedFailure.at("/source/id").asText(),
+            pinnedFailure.at("/evaluation/question_set/hash").asText(),
+            pinnedFailure.at("/evaluation/state_policy/hash").asText(),
+            "jev-1.13.0"),
+        pinnedFailure.at("/evaluation/id").asText());
+    assertEquals(
+        "jev-1.13.0",
+        utf8(pinnedOutput.history().get(0).headers().lastHeader("kafka-jev-resolved-model").value()));
+    pinnedTask.stop();
+  }
+
+  @Test
   void tombstonesCanBeIgnoredDeadLetteredOrMadeTaskFatal() throws Exception {
     fakeJev = fakeJev(new AtomicReference<>());
     SinkRecord tombstone = sourceRecord(null, "customer-42", null, null);
