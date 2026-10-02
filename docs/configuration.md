@@ -23,7 +23,7 @@ For the initial low-throughput profile, deployment examples set the standard `co
 | --- | --- | --- |
 | `jev.endpoint` | `https://api.typesafe.ai/v1/systemone` | Evaluation endpoint. Redirects are rejected. |
 | `jev.allow.insecure.http` | `false` | Allows HTTP only for explicit local testing. |
-| `jev.model` | `jev-latest` | Requested model alias or versioned ID. Pin a version in production. |
+| `jev.model` | `jev-latest` | Requested model alias or pinned versioned ID. IDs matching `jev-MAJOR.MINOR.PATCH` (with an optional SemVer suffix) are pinned; every other non-empty reference is classified as an alias. Pin a version in production. |
 | `jev.max.in.flight` | `4` | Maximum concurrent Jev requests per task. |
 | `jev.connect.timeout.ms` | `5000` | HTTP connection timeout. |
 | `jev.request.timeout.ms` | `10000` | Timeout for one Evaluation Attempt. |
@@ -44,7 +44,9 @@ In Confluent Cloud, the connector reads `kafka.endpoint`, `kafka.api.key`, and `
 
 For local operation, `output.bootstrap.servers` identifies the Kafka brokers used by the plugin-owned producer. An unauthenticated local broker uses `PLAINTEXT`; secured local testing may supply the same Kafka API-key properties used in Cloud.
 
-The connector does not expose arbitrary producer overrides. Idempotence, `acks=all`, serializers, Cloud security protocol, retry classification, and disabled topic auto-creation are mandatory behavior.
+The connector does not expose arbitrary producer overrides. Idempotence, `acks=all`, serializers, Cloud security protocol, and retry classification are mandatory behavior.
+
+The connector uses the Kafka Admin API to describe every configured input, output, and dead-letter topic when the Connector Instance starts. Each task independently describes its output and dead-letter topics before constructing its producer, so a task restart cannot bypass the pre-created-topic check. Kafka 4.2 producers do not support `allow.auto.create.topics` (that setting belongs to consumers), so no producer property can disable creation. There is necessarily a race if a topic is deleted after the Admin check but before a producer metadata request. To guarantee that this race cannot recreate a topic, disable broker-side topic auto-creation (or its managed-platform equivalent) and do not grant the connector principal topic-creation privileges.
 
 ## Failure Classification
 

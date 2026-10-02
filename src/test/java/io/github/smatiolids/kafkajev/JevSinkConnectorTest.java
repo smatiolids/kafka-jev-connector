@@ -53,6 +53,7 @@ class JevSinkConnectorTest {
       assertThrows(ConfigException.class, () -> connector().start(blank), "blank " + required);
     }
     assertThrows(ConfigException.class, () -> connector().start(with("jev.model", "   ")));
+    assertThrows(ConfigException.class, () -> connector().start(with("jev.model", " jev-latest ")));
   }
 
   @Test

@@ -134,7 +134,7 @@ All deterministic hashes use RFC 8785 JSON Canonicalization Scheme followed by S
 - Evaluation State hash is SHA-256 over the exact UTF-8 state string sent to Jev; it is not JSON-canonicalized again.
 - Evaluation ID hashes `{ "source_id", "question_set_hash", "state_policy_hash", "effective_model" }`.
 
-For a successful alias-based evaluation, `effective_model` is the resolved version returned by Jev. For a Failed Evaluation where an alias could not be resolved, it is `unresolved:<alias>`.
+For a successful alias-based evaluation, `effective_model` is the resolved version returned by Jev. Before a response exists, a configured model matching `jev-MAJOR.MINOR.PATCH` (with an optional SemVer suffix) is a pinned reference and is already its own effective model. Every other non-empty model reference is an alias; a Failed Evaluation where that alias could not be resolved uses `unresolved:<alias>`. Thus a local failure requested with `jev-1.13.0` keeps `jev-1.13.0`, while the same failure requested with `jev-latest` records `unresolved:jev-latest`.
 
 ## Evaluation State Templates
 

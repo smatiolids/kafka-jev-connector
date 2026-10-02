@@ -21,6 +21,7 @@ import java.util.Date;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -522,6 +523,41 @@ class JevSinkTaskTest {
   }
 
   @Test
+  void failedEvaluationUsesPinnedModelIdentityAndOnlyAliasesUseAnUnresolvedSentinel()
+      throws Exception {
+    SinkRecord missing = sourceRecord(null, "customer-42", null, Map.of("secret", "hidden"));
+
+    MockProducer<String, String> aliasOutput = output();
+    JevSinkTask aliasTask = new JevSinkTask(ignored -> aliasOutput);
+    aliasTask.start(requiredTemplateConfig());
+    aliasTask.put(List.of(missing));
+    JsonNode aliasFailure = JSON.readTree(aliasOutput.history().get(0).value());
+    assertEquals("unresolved:jev-latest", aliasFailure.at("/evaluation/model/resolved").asText());
+    aliasTask.stop();
+
+    Map<String, String> pinned = new java.util.HashMap<>(requiredTemplateConfig());
+    pinned.put("jev.model", "jev-1.13.0");
+    MockProducer<String, String> pinnedOutput = output();
+    JevSinkTask pinnedTask = new JevSinkTask(ignored -> pinnedOutput);
+    pinnedTask.start(pinned);
+    pinnedTask.put(List.of(missing));
+    JsonNode pinnedFailure = JSON.readTree(pinnedOutput.history().get(0).value());
+    assertEquals("jev-1.13.0", pinnedFailure.at("/evaluation/model/requested").asText());
+    assertEquals("jev-1.13.0", pinnedFailure.at("/evaluation/model/resolved").asText());
+    assertEquals(
+        DeterministicIds.evaluationId(
+            pinnedFailure.at("/source/id").asText(),
+            pinnedFailure.at("/evaluation/question_set/hash").asText(),
+            pinnedFailure.at("/evaluation/state_policy/hash").asText(),
+            "jev-1.13.0"),
+        pinnedFailure.at("/evaluation/id").asText());
+    assertEquals(
+        "jev-1.13.0",
+        utf8(pinnedOutput.history().get(0).headers().lastHeader("kafka-jev-resolved-model").value()));
+    pinnedTask.stop();
+  }
+
+  @Test
   void tombstonesCanBeIgnoredDeadLetteredOrMadeTaskFatal() throws Exception {
     fakeJev = fakeJev(new AtomicReference<>());
     SinkRecord tombstone = sourceRecord(null, "customer-42", null, null);
@@ -648,6 +684,46 @@ class JevSinkTaskTest {
   }
 
   @Test
+  void templateWholeValueAppliesTheRawBytesPolicyAndStrictUtf8Decoding() throws Exception {
+    AtomicReference<JsonNode> receivedRequest = new AtomicReference<>();
+    fakeJev = fakeJev(receivedRequest);
+    Map<String, String> template = new java.util.HashMap<>(config());
+    template.put("state.mode", "TEMPLATE");
+    template.put("state.template", "payload=${value}");
+
+    MockProducer<String, String> disabledOutput = output();
+    JevSinkTask disabled = new JevSinkTask(ignored -> disabledOutput);
+    disabled.start(template);
+    disabled.put(
+        List.of(
+            sourceRecord(
+                null, null, Schema.BYTES_SCHEMA, "private".getBytes(StandardCharsets.UTF_8))));
+    assertEquals(
+        "RAW_BYTES_DISABLED",
+        JSON.readTree(disabledOutput.history().get(0).value()).at("/error/code").asText());
+    assertEquals(null, receivedRequest.get());
+    disabled.stop();
+
+    template.put("state.raw_bytes.encoding", "UTF-8");
+    MockProducer<String, String> enabledOutput = output();
+    JevSinkTask enabled = new JevSinkTask(ignored -> enabledOutput);
+    enabled.start(template);
+    enabled.put(
+        List.of(
+            sourceRecord(
+                null, null, Schema.BYTES_SCHEMA, "Olá".getBytes(StandardCharsets.UTF_8))));
+    assertEquals("payload=Olá", receivedRequest.get().path("state").asText());
+
+    enabled.put(
+        List.of(
+            sourceRecord(null, null, Schema.BYTES_SCHEMA, new byte[] {(byte) 0xc3, 0x28})));
+    assertEquals(
+        "INVALID_UTF8",
+        JSON.readTree(enabledOutput.history().get(1).value()).at("/error/code").asText());
+    enabled.stop();
+  }
+
+  @Test
   void deadLettersEvaluationStateThatExceedsTheConfiguredUtf8ByteLimit() throws Exception {
     AtomicReference<JsonNode> receivedRequest = new AtomicReference<>();
     fakeJev = fakeJev(receivedRequest);
@@ -718,9 +794,47 @@ class JevSinkTaskTest {
     assertEquals(StringSerializer.class.getName(), actual.get(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG));
     assertEquals(
         StringSerializer.class.getName(), actual.get(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG));
-    assertEquals(false, actual.get("allow.auto.create.topics"));
+    assertFalse(actual.containsKey("allow.auto.create.topics"));
     assertFalse(actual.keySet().stream().anyMatch(name -> name.startsWith("producer.override.")));
     task.stop();
+  }
+
+  @Test
+  void taskVerifiesPrecreatedPublicationTopicsBeforeConstructingItsProducer() {
+    AtomicReference<Set<String>> checkedTopics = new AtomicReference<>();
+    AtomicReference<Map<String, Object>> checkedProperties = new AtomicReference<>();
+    AtomicInteger producerCreations = new AtomicInteger();
+    JevSinkTask task =
+        new JevSinkTask(
+            properties -> {
+              producerCreations.incrementAndGet();
+              return output();
+            },
+            (topics, properties) -> {
+              checkedTopics.set(Set.copyOf(topics));
+              checkedProperties.set(Map.copyOf(properties));
+            });
+
+    task.start(config("http://127.0.0.1:1/evaluate"));
+
+    assertEquals(Set.of("support-output", "support-dlq"), checkedTopics.get());
+    assertFalse(checkedProperties.get().containsKey("allow.auto.create.topics"));
+    assertEquals(1, producerCreations.get());
+    task.stop();
+
+    JevSinkTask missingTopics =
+        new JevSinkTask(
+            properties -> {
+              producerCreations.incrementAndGet();
+              return output();
+            },
+            (topics, properties) -> {
+              throw new ConnectException("Publication topics must be pre-created");
+            });
+    assertThrows(
+        ConnectException.class,
+        () -> missingTopics.start(config("http://127.0.0.1:1/evaluate")));
+    assertEquals(1, producerCreations.get());
   }
 
   @Test
