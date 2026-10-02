@@ -1,0 +1,40 @@
+{
+  "name": "kafka-jev-connector",
+  "title": "Kafka Jev Connector",
+  "version": "${project.version}",
+  "description": "Kafka Connect sink connector that evaluates Source Records with TypeSafe AI Jev and publishes complete inference evidence back to Kafka.",
+  "component_types": [
+    "sink"
+  ],
+  "connector_class": "io.github.smatiolids.kafkajev.JevSinkConnector",
+  "documentation_url": "https://github.com/smatiolids/kafka-jev-connector",
+  "kafka_version": "${kafka.version}",
+  "java_version": "17",
+  "features": {
+    "delivery_guarantee": [
+      "at_least_once"
+    ],
+    "kafka_connect_api": true,
+    "single_message_transforms": true,
+    "supported_encodings": [
+      "any"
+    ]
+  },
+  "license": [
+    {
+      "name": "Apache License, Version 2.0",
+      "url": "https://www.apache.org/licenses/LICENSE-2.0"
+    }
+  ],
+  "owner": {
+    "name": "Samuel Matioli",
+    "type": "user",
+    "url": "https://github.com/smatiolids",
+    "username": "smatiolids"
+  },
+  "sensitive_config_properties": [
+    "jev.api.key",
+    "kafka.api.key",
+    "kafka.api.secret"
+  ]
+}
