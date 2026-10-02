@@ -16,7 +16,7 @@ final class SmokeEnvironmentIT {
 
     assertTrue(compose.contains("apache/kafka:4.2.0"));
     assertTrue(compose.contains("fake-jev"));
-    assertTrue(connectImage.contains("kafka-jev-connector-1.0.0-SNAPSHOT-plugin.zip"));
+    assertTrue(connectImage.contains("kafka-jev-connector-0.1-plugin.zip"));
     assertTrue(fakeJev.contains("permanent-secret-marker"));
     assertTrue(fakeJev.contains("transient-secret-marker"));
     assertTrue(smoke.contains("TRANSIENT_UNCOMMITTED_OK"));

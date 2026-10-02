@@ -1,4 +1,4 @@
 *
-!target/kafka-jev-connector-1.0.0-SNAPSHOT-plugin.zip
+!target/kafka-jev-connector-0.1-plugin.zip
 !local-kafka/
 !local-kafka/**

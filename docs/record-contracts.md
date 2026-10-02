@@ -43,7 +43,7 @@ An Enriched Record retains the canonicalized Source Record key and value, evalua
   "connector": {
     "name": "production-fraud-screening",
     "plugin": "kafka-jev-connector",
-    "version": "1.0.0"
+    "version": "0.1"
   },
   "jev": {
     "model": "jev-1.13.0",
@@ -100,7 +100,7 @@ A Dead-Letter Record describes a permanent record-specific Failed Evaluation. It
   "connector": {
     "name": "production-fraud-screening",
     "plugin": "kafka-jev-connector",
-    "version": "1.0.0"
+    "version": "0.1"
   }
 }
 ```
