@@ -88,7 +88,7 @@ class JevSinkTaskTest {
             Map.entry("jev.endpoint", endpoint()),
             Map.entry("jev.allow.insecure.http", "true"),
             Map.entry("output.bootstrap.servers", "unused:9092"));
-    JevSinkConnector connector = new JevSinkConnector();
+    JevSinkConnector connector = new JevSinkConnector((topics, properties) -> {});
     connector.start(connectorConfig);
     assertEquals(JevSinkTask.class, connector.taskClass());
     assertEquals(connectorConfig, connector.taskConfigs(1).get(0));
