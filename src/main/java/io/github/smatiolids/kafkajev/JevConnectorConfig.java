@@ -27,6 +27,7 @@ final class JevConnectorConfig extends AbstractConfig {
   static final String ENDPOINT = "jev.endpoint";
   static final String ALLOW_HTTP = "jev.allow.insecure.http";
   static final String MODEL = "jev.model";
+  static final String MAX_IN_FLIGHT = "jev.max.in.flight";
   static final String CONNECT_TIMEOUT_MS = "jev.connect.timeout.ms";
   static final String REQUEST_TIMEOUT_MS = "jev.request.timeout.ms";
   static final String RETRY_MAX_ATTEMPTS = "jev.retry.max.attempts";
@@ -90,6 +91,13 @@ final class JevConnectorConfig extends AbstractConfig {
               "Jev endpoint")
           .define(ALLOW_HTTP, ConfigDef.Type.BOOLEAN, false, ConfigDef.Importance.LOW, "Allow local HTTP")
           .define(MODEL, ConfigDef.Type.STRING, "jev-latest", ConfigDef.Importance.MEDIUM, "Requested model")
+          .define(
+              MAX_IN_FLIGHT,
+              ConfigDef.Type.INT,
+              4,
+              ConfigDef.Range.atLeast(1),
+              ConfigDef.Importance.MEDIUM,
+              "Maximum concurrent Jev requests per task")
           .define(
               CONNECT_TIMEOUT_MS,
               ConfigDef.Type.INT,

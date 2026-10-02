@@ -789,6 +789,129 @@ class JevSinkTaskTest {
   }
 
   @Test
+  void neverExceedsTheConfiguredMaximumOfInFlightJevRequests() throws Exception {
+    AtomicInteger inFlight = new AtomicInteger();
+    AtomicInteger maximumInFlight = new AtomicInteger();
+    CountDownLatch twoRequestsStarted = new CountDownLatch(2);
+    CountDownLatch releaseRequests = new CountDownLatch(1);
+    fakeJev = concurrentFakeJev(inFlight, maximumInFlight, twoRequestsStarted, releaseRequests);
+    Map<String, String> bounded = new java.util.HashMap<>(config());
+    bounded.put("jev.max.in.flight", "2");
+    MockProducer<String, String> output = output();
+    JevSinkTask task = new JevSinkTask(ignored -> output);
+    task.start(bounded);
+    ExecutorService worker = Executors.newSingleThreadExecutor();
+    try {
+      Future<?> deliveredBatch =
+          worker.submit(
+              () ->
+                  task.put(
+                      List.of(
+                          sourceRecord(184, "first"),
+                          sourceRecord(185, "second"),
+                          sourceRecord(186, "third"),
+                          sourceRecord(187, "fourth"))));
+
+      assertTrue(twoRequestsStarted.await(2, TimeUnit.SECONDS));
+      assertEquals(2, maximumInFlight.get());
+      assertFalse(deliveredBatch.isDone());
+
+      releaseRequests.countDown();
+      deliveredBatch.get(2, TimeUnit.SECONDS);
+      assertEquals(4, output.history().size());
+      assertEquals(2, maximumInFlight.get());
+    } finally {
+      releaseRequests.countDown();
+      worker.shutdownNow();
+      task.stop();
+    }
+  }
+
+  @Test
+  void mixedSuccessfulAndPermanentFailureRecordsPublishTheirOwnOutcomes() throws Exception {
+    fakeJev = stateAwareFakeJev();
+    Map<String, String> concurrent = new java.util.HashMap<>(config());
+    concurrent.put("jev.max.in.flight", "2");
+    MockProducer<String, String> output = output();
+    JevSinkTask task = new JevSinkTask(ignored -> output);
+    task.start(concurrent);
+
+    task.put(
+        List.of(
+            sourceRecord(184, "first success"),
+            sourceRecord(185, "reject this record"),
+            sourceRecord(186, "second success")));
+
+    assertEquals(
+        2, output.history().stream().filter(record -> "support-output".equals(record.topic())).count());
+    assertEquals(
+        1, output.history().stream().filter(record -> "support-dlq".equals(record.topic())).count());
+    ProducerRecord<String, String> deadLetter =
+        output.history().stream()
+            .filter(record -> "support-dlq".equals(record.topic()))
+            .findFirst()
+            .orElseThrow();
+    assertEquals("RECORD_TOO_LARGE", JSON.readTree(deadLetter.value()).at("/error/code").asText());
+    task.stop();
+  }
+
+  @Test
+  void doesNotCompleteAMultiRecordBatchUntilEveryPublicationIsAcknowledged() throws Exception {
+    fakeJev = fakeJev(new AtomicReference<>());
+    ControllableProducer output = new ControllableProducer(2);
+    Map<String, String> concurrent = new java.util.HashMap<>(config());
+    concurrent.put("jev.max.in.flight", "2");
+    JevSinkTask task = new JevSinkTask(ignored -> output);
+    task.start(concurrent);
+    ExecutorService worker = Executors.newSingleThreadExecutor();
+    try {
+      Future<?> deliveredBatch =
+          worker.submit(
+              () -> task.put(List.of(sourceRecord(184, "first"), sourceRecord(185, "second"))));
+
+      assertTrue(output.publicationAttempted.await(2, TimeUnit.SECONDS));
+      assertFalse(deliveredBatch.isDone());
+
+      assertTrue(output.completeNext());
+      assertFalse(deliveredBatch.isDone());
+      assertTrue(output.completeNext());
+      deliveredBatch.get(2, TimeUnit.SECONDS);
+    } finally {
+      worker.shutdownNow();
+      task.stop();
+    }
+  }
+
+  @Test
+  void exhaustedTransientFailureKeepsTheMixedBatchIneligibleForCommit() throws Exception {
+    AtomicInteger attempts = new AtomicInteger();
+    fakeJev =
+        fakeJevResponses(
+            attempts,
+            List.of(
+                new FakeResponse(503, "private outage", null),
+                new FakeResponse(200, "{\"model\":\"jev-1.13.0\"}", null)));
+    Map<String, String> concurrent = new java.util.HashMap<>(config());
+    concurrent.put("jev.max.in.flight", "2");
+    concurrent.put("jev.retry.max.attempts", "1");
+    MockProducer<String, String> output = output();
+    JevSinkTask task = new JevSinkTask(ignored -> output);
+    task.start(concurrent);
+    Map<TopicPartition, OffsetAndMetadata> deliveredOffsets =
+        Map.of(new TopicPartition("support-input", 2), new OffsetAndMetadata(186));
+
+    assertThrows(
+        ConnectException.class,
+        () -> task.put(List.of(sourceRecord(184, "one"), sourceRecord(185, "two"))));
+
+    assertEquals(2, attempts.get());
+    assertEquals(1, output.history().size());
+    assertEquals("support-output", output.history().get(0).topic());
+    assertEquals(Map.of(), task.preCommit(deliveredOffsets));
+    task.stop();
+  }
+
+  @Test
   void replayAndEquivalentConfigurationKeepIdentityWhileEffectiveChangesCreateANewEvaluation()
       throws Exception {
     AtomicReference<JsonNode> receivedRequest = new AtomicReference<>();
@@ -1180,6 +1303,19 @@ class JevSinkTaskTest {
         TimestampType.CREATE_TIME);
   }
 
+  private SinkRecord sourceRecord(long offset, Object value) {
+    return new SinkRecord(
+        "support-input",
+        2,
+        null,
+        "customer-" + offset,
+        null,
+        value,
+        offset,
+        Instant.parse("2026-10-02T13:45:12.345Z").toEpochMilli(),
+        TimestampType.CREATE_TIME);
+  }
+
   private MockProducer<String, String> output() {
     return new MockProducer<>(true, null, new StringSerializer(), new StringSerializer());
   }
@@ -1189,10 +1325,15 @@ class JevSinkTaskTest {
   }
 
   private static final class ControllableProducer extends MockProducer<String, String> {
-    private final CountDownLatch publicationAttempted = new CountDownLatch(1);
+    private final CountDownLatch publicationAttempted;
 
     private ControllableProducer() {
+      this(1);
+    }
+
+    private ControllableProducer(int expectedPublications) {
       super(false, null, new StringSerializer(), new StringSerializer());
+      publicationAttempted = new CountDownLatch(expectedPublications);
     }
 
     @Override
@@ -1309,6 +1450,58 @@ class JevSinkTaskTest {
           } finally {
             exchange.close();
           }
+        });
+    server.start();
+    return server;
+  }
+
+  private HttpServer concurrentFakeJev(
+      AtomicInteger inFlight,
+      AtomicInteger maximumInFlight,
+      CountDownLatch requestsStarted,
+      CountDownLatch releaseRequests)
+      throws IOException {
+    HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+    fakeJevExecutor = Executors.newCachedThreadPool();
+    server.setExecutor(fakeJevExecutor);
+    server.createContext(
+        "/evaluate",
+        exchange -> {
+          exchange.getRequestBody().readAllBytes();
+          int currentInFlight = inFlight.incrementAndGet();
+          maximumInFlight.accumulateAndGet(currentInFlight, Math::max);
+          requestsStarted.countDown();
+          try {
+            releaseRequests.await(2, TimeUnit.SECONDS);
+            byte[] response = "{\"model\":\"jev-1.13.0\"}".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, response.length);
+            exchange.getResponseBody().write(response);
+          } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+          } finally {
+            inFlight.decrementAndGet();
+            exchange.close();
+          }
+        });
+    server.start();
+    return server;
+  }
+
+  private HttpServer stateAwareFakeJev() throws IOException {
+    HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+    fakeJevExecutor = Executors.newCachedThreadPool();
+    server.setExecutor(fakeJevExecutor);
+    server.createContext(
+        "/evaluate",
+        exchange -> {
+          String state = JSON.readTree(exchange.getRequestBody()).path("state").asText();
+          boolean rejected = state.contains("reject");
+          byte[] response =
+              (rejected ? "private size details" : "{\"model\":\"jev-1.13.0\"}")
+                  .getBytes(StandardCharsets.UTF_8);
+          exchange.sendResponseHeaders(rejected ? 413 : 200, response.length);
+          exchange.getResponseBody().write(response);
+          exchange.close();
         });
     server.start();
     return server;
