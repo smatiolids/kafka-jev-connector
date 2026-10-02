@@ -154,6 +154,139 @@ class JevSinkTaskTest {
   }
 
   @Test
+  void evaluationIdKeyModeUsesTheDeterministicEvaluationId() throws Exception {
+    fakeJev = fakeJev(new AtomicReference<>());
+    Map<String, String> evaluationIdKeys = new java.util.HashMap<>(config());
+    evaluationIdKeys.put("output.key.mode", "EVALUATION_ID");
+    MockProducer<String, String> output = output();
+    JevSinkTask task = new JevSinkTask(ignored -> output);
+    task.start(evaluationIdKeys);
+
+    task.put(List.of(sourceRecord(null, Map.of("tenant", "acme"), null, "same source")));
+
+    ProducerRecord<String, String> published = output.history().get(0);
+    JsonNode enriched = JSON.readTree(published.value());
+    assertEquals(enriched.at("/evaluation/id").asText(), published.key());
+    assertEquals(
+        "sha256:dcc2ee43358f5b0068a0ad5d2e499b306524c96d74c167f60def5dce019e3fa9",
+        published.key());
+    task.stop();
+  }
+
+  @Test
+  void inputHeadersAreOptInWhileConnectorProvenanceIsAlwaysPresent() throws Exception {
+    fakeJev = fakeJev(new AtomicReference<>());
+    ConnectHeaders sourceHeaders = new ConnectHeaders();
+    sourceHeaders.addString("trace-id", "trace-123");
+    sourceHeaders.addString("kafka-jev-evaluation-id", "untrusted-input");
+    SinkRecord source =
+        new SinkRecord(
+            "support-input",
+            2,
+            null,
+            "customer-42",
+            null,
+            "same source",
+            184,
+            Instant.parse("2026-10-02T13:45:12.345Z").toEpochMilli(),
+            TimestampType.CREATE_TIME,
+            sourceHeaders);
+
+    MockProducer<String, String> defaultOutput = output();
+    JevSinkTask defaultTask = new JevSinkTask(ignored -> defaultOutput);
+    defaultTask.start(config());
+    defaultTask.put(List.of(source));
+
+    ProducerRecord<String, String> defaultRecord = defaultOutput.history().get(0);
+    JsonNode defaultBody = JSON.readTree(defaultRecord.value());
+    assertEquals(null, defaultRecord.headers().lastHeader("trace-id"));
+    assertEquals(
+        defaultBody.at("/evaluation/id").asText(),
+        utf8(defaultRecord.headers().lastHeader("kafka-jev-evaluation-id").value()));
+    assertEquals(
+        "jev-1.13.0",
+        utf8(defaultRecord.headers().lastHeader("kafka-jev-resolved-model").value()));
+    defaultTask.stop();
+
+    Map<String, String> copying = new java.util.HashMap<>(config());
+    copying.put("output.headers.mode", "COPY");
+    MockProducer<String, String> copyOutput = output();
+    JevSinkTask copyTask = new JevSinkTask(ignored -> copyOutput);
+    copyTask.start(copying);
+    copyTask.put(List.of(source));
+
+    ProducerRecord<String, String> copiedRecord = copyOutput.history().get(0);
+    JsonNode copiedBody = JSON.readTree(copiedRecord.value());
+    assertEquals("trace-123", utf8(copiedRecord.headers().lastHeader("trace-id").value()));
+    assertEquals(
+        copiedBody.at("/evaluation/id").asText(),
+        utf8(copiedRecord.headers().lastHeader("kafka-jev-evaluation-id").value()));
+    assertEquals(
+        2,
+        java.util.stream.StreamSupport.stream(
+                copiedRecord.headers().headers("kafka-jev-evaluation-id").spliterator(), false)
+            .count());
+    copyTask.stop();
+  }
+
+  @Test
+  void deadLetterKeyTimestampAndProvenanceIgnoreEnrichedOutputPolicies() throws Exception {
+    Map<String, String> configured = new java.util.HashMap<>(requiredTemplateConfig());
+    configured.put("output.key.mode", "EVALUATION_ID");
+    configured.put("output.headers.mode", "COPY");
+    ConnectHeaders sourceHeaders = new ConnectHeaders();
+    sourceHeaders.addString("trace-id", "must-not-cross-the-dlq-boundary");
+    long sourceTimestamp = Instant.parse("2026-10-02T13:45:12.345Z").toEpochMilli();
+    SinkRecord source =
+        new SinkRecord(
+            "support-input",
+            2,
+            null,
+            "customer-42",
+            null,
+            Map.of("message", "safe"),
+            184,
+            sourceTimestamp,
+            TimestampType.CREATE_TIME,
+            sourceHeaders);
+    MockProducer<String, String> output = output();
+    JevSinkTask task = new JevSinkTask(ignored -> output);
+    task.start(configured);
+
+    task.put(List.of(source));
+
+    ProducerRecord<String, String> published = output.history().get(0);
+    JsonNode deadLetter = JSON.readTree(published.value());
+    assertEquals("support-dlq", published.topic());
+    assertEquals(deadLetter.at("/source/id").asText(), published.key());
+    assertNotEquals(deadLetter.at("/evaluation/id").asText(), published.key());
+    assertEquals(sourceTimestamp, published.timestamp());
+    assertEquals(null, published.headers().lastHeader("trace-id"));
+    assertEquals(
+        deadLetter.at("/evaluation/id").asText(),
+        utf8(published.headers().lastHeader("kafka-jev-evaluation-id").value()));
+    assertEquals(
+        "unresolved:jev-latest",
+        utf8(published.headers().lastHeader("kafka-jev-resolved-model").value()));
+    task.stop();
+  }
+
+  @Test
+  void rejectsUnknownOutputKeyAndHeaderModesAtStartup() {
+    Map<String, String> invalidKeyMode = new java.util.HashMap<>(requiredTemplateConfig());
+    invalidKeyMode.put("output.key.mode", "SOURCE_ID");
+    assertThrows(
+        ConfigException.class,
+        () -> new JevSinkTask(ignored -> output()).start(invalidKeyMode));
+
+    Map<String, String> invalidHeaderMode = new java.util.HashMap<>(requiredTemplateConfig());
+    invalidHeaderMode.put("output.headers.mode", "ALL");
+    assertThrows(
+        ConfigException.class,
+        () -> new JevSinkTask(ignored -> output()).start(invalidHeaderMode));
+  }
+
+  @Test
   void canonicalizesConnectValuesAndPublishesFixedProvenanceVectors() throws Exception {
     AtomicReference<JsonNode> receivedRequest = new AtomicReference<>();
     fakeJev = fakeJev(receivedRequest);
@@ -1185,6 +1318,10 @@ class JevSinkTaskTest {
 
   private MockProducer<String, String> output() {
     return new MockProducer<>(true, null, new StringSerializer(), new StringSerializer());
+  }
+
+  private static String utf8(byte[] value) {
+    return new String(value, StandardCharsets.UTF_8);
   }
 
   private static final class ControllableProducer extends MockProducer<String, String> {

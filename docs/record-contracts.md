@@ -53,7 +53,9 @@ An Enriched Record retains the canonicalized Source Record key and value, evalua
 }
 ```
 
-The Kafka record timestamp preserves the source timestamp. The Kafka key defaults to the canonicalized original key; configuring Evaluation ID as the key is opt-in. Connector-owned headers may expose Evaluation ID and resolved model, but input headers are not copied by default.
+The Kafka record timestamp preserves the source timestamp. The Kafka key defaults to the canonicalized original key; configuring Evaluation ID as the key is opt-in. Input headers are not copied by default. When `output.headers.mode=COPY`, byte headers retain their bytes, string headers use UTF-8, null headers remain null, and other Connect values use their canonical JSON representation encoded as UTF-8.
+
+Every Enriched Record has two connector-owned UTF-8 provenance headers regardless of input-header copy mode: `kafka-jev-evaluation-id` contains the Evaluation ID and `kafka-jev-resolved-model` contains the resolved model. Copied input headers are added first, so a colliding connector-owned header is always appended last and remains authoritative through Kafka's `lastHeader` lookup.
 
 ## Dead-Letter Record
 
@@ -103,7 +105,7 @@ A Dead-Letter Record describes a permanent record-specific Failed Evaluation. It
 }
 ```
 
-Dead-letter Kafka keys are always Source ID. Error messages are sanitized and length-bounded. Dead-Letter Records are diagnostic evidence and are not valid Source Records; manual republishing of their original key and value creates a new Source ID and Evaluation ID.
+Dead-letter Kafka keys are always Source ID, regardless of `output.key.mode`, and their Kafka timestamps preserve the Source Record timestamp. Input headers are never copied to dead-letter output, even when `output.headers.mode=COPY`. Dead-Letter Records still carry connector-owned `kafka-jev-evaluation-id` and `kafka-jev-resolved-model` UTF-8 headers for their failed evaluation. Error messages are sanitized and length-bounded. Dead-Letter Records are diagnostic evidence and are not valid Source Records; manual republishing of their original key and value creates a new Source ID and Evaluation ID.
 
 When Evaluation State construction succeeded before a later permanent failure, `evaluation.state.hash` is included using the same shape as an Enriched Record. It is absent when state construction itself failed.
 

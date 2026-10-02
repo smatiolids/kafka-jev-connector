@@ -35,6 +35,7 @@ import org.apache.kafka.clients.producer.Producer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.common.header.internals.RecordHeaders;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.apache.kafka.connect.data.Schema;
@@ -44,6 +45,8 @@ import org.apache.kafka.connect.sink.SinkTask;
 
 public final class JevSinkTask extends SinkTask {
   private static final HttpHeaders EMPTY_HEADERS = HttpHeaders.of(Map.of(), (name, value) -> true);
+  private static final String EVALUATION_ID_HEADER = "kafka-jev-evaluation-id";
+  private static final String RESOLVED_MODEL_HEADER = "kafka-jev-resolved-model";
 
   private final Function<Map<String, Object>, Producer<String, String>> producerFactory;
   private final Sleeper sleeper;
@@ -232,14 +235,21 @@ public final class JevSinkTask extends SinkTask {
             success.inferenceResult(),
             success.attemptCount(),
             durationMillis);
-    String key = sourceRecord.key() == null ? null : render(canonicalKey);
+    String key =
+        "EVALUATION_ID".equals(config.getString(JevConnectorConfig.OUTPUT_KEY_MODE))
+            ? enriched.at("/evaluation/id").asText()
+            : sourceRecord.key() == null ? null : render(canonicalKey);
     ProducerRecord<String, String> output =
         new ProducerRecord<>(
             config.getString(JevConnectorConfig.OUTPUT_TOPIC),
             null,
             sourceRecord.timestamp(),
             key,
-            CanonicalJson.write(enriched));
+            CanonicalJson.write(enriched),
+            enrichedHeaders(
+                sourceRecord,
+                enriched.at("/evaluation/id").asText(),
+                success.inferenceResult().resolvedModel()));
     publish(output, "Enriched Record");
   }
 
@@ -297,8 +307,47 @@ public final class JevSinkTask extends SinkTask {
             null,
             sourceRecord.timestamp(),
             sourceId,
-            CanonicalJson.write(deadLetter)),
+            CanonicalJson.write(deadLetter),
+            provenanceHeaders(evaluation.path("id").asText(), unresolvedModel)),
         "Dead-Letter Record");
+  }
+
+  private RecordHeaders enrichedHeaders(
+      SinkRecord sourceRecord, String evaluationId, String resolvedModel) {
+    RecordHeaders headers = new RecordHeaders();
+    if ("COPY".equals(config.getString(JevConnectorConfig.OUTPUT_HEADERS_MODE))) {
+      sourceRecord.headers().forEach(header -> headers.add(header.key(), outputHeaderValue(header)));
+    }
+    headers.add(EVALUATION_ID_HEADER, evaluationId.getBytes(StandardCharsets.UTF_8));
+    headers.add(RESOLVED_MODEL_HEADER, resolvedModel.getBytes(StandardCharsets.UTF_8));
+    return headers;
+  }
+
+  private RecordHeaders provenanceHeaders(String evaluationId, String resolvedModel) {
+    RecordHeaders headers = new RecordHeaders();
+    headers.add(EVALUATION_ID_HEADER, evaluationId.getBytes(StandardCharsets.UTF_8));
+    headers.add(RESOLVED_MODEL_HEADER, resolvedModel.getBytes(StandardCharsets.UTF_8));
+    return headers;
+  }
+
+  private byte[] outputHeaderValue(org.apache.kafka.connect.header.Header header) {
+    Object value = header.value();
+    if (value == null) {
+      return null;
+    }
+    if (value instanceof byte[] bytes) {
+      return bytes.clone();
+    }
+    if (value instanceof ByteBuffer buffer) {
+      ByteBuffer copy = buffer.duplicate();
+      byte[] bytes = new byte[copy.remaining()];
+      copy.get(bytes);
+      return bytes;
+    }
+    if (value instanceof String text) {
+      return text.getBytes(StandardCharsets.UTF_8);
+    }
+    return render(canonicalizer.canonicalize(header.schema(), value)).getBytes(StandardCharsets.UTF_8);
   }
 
   private void publish(ProducerRecord<String, String> record, String recordType) {

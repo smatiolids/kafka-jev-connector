@@ -34,6 +34,8 @@ final class JevConnectorConfig extends AbstractConfig {
   static final String RETRY_INITIAL_BACKOFF_MS = "jev.retry.initial.backoff.ms";
   static final String RETRY_MAX_RETRY_AFTER_MS = "jev.retry.max.retry_after.ms";
   static final String TRANSIENT_EXHAUSTED = "errors.transient.exhausted";
+  static final String OUTPUT_KEY_MODE = "output.key.mode";
+  static final String OUTPUT_HEADERS_MODE = "output.headers.mode";
   static final String OUTPUT_BOOTSTRAP = "output.bootstrap.servers";
 
   private static final ObjectMapper JSON = new ObjectMapper();
@@ -138,6 +140,20 @@ final class JevConnectorConfig extends AbstractConfig {
               ConfigDef.ValidString.in("FAIL", "DLQ"),
               ConfigDef.Importance.MEDIUM,
               "Outcome after transient Jev attempts are exhausted")
+          .define(
+              OUTPUT_KEY_MODE,
+              ConfigDef.Type.STRING,
+              "ORIGINAL",
+              ConfigDef.ValidString.in("ORIGINAL", "EVALUATION_ID"),
+              ConfigDef.Importance.MEDIUM,
+              "Enriched Record Kafka key policy")
+          .define(
+              OUTPUT_HEADERS_MODE,
+              ConfigDef.Type.STRING,
+              "NONE",
+              ConfigDef.ValidString.in("NONE", "COPY"),
+              ConfigDef.Importance.MEDIUM,
+              "Source Record header propagation policy")
           .define(
               OUTPUT_BOOTSTRAP,
               ConfigDef.Type.STRING,
