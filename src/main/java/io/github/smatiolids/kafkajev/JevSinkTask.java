@@ -74,14 +74,60 @@ public final class JevSinkTask extends SinkTask {
   }
 
   private void evaluateAndPublish(SinkRecord sourceRecord) {
+    if (sourceRecord.value() == null
+        && "IGNORE".equals(config.getString(JevConnectorConfig.TOMBSTONE_BEHAVIOR))) {
+      return;
+    }
+    if (sourceRecord.value() == null
+        && "FAIL".equals(config.getString(JevConnectorConfig.TOMBSTONE_BEHAVIOR))) {
+      throw new ConnectException("Tombstone Source Record configured to fail the task");
+    }
+    long startedAt = System.nanoTime();
     JsonNode canonicalValue =
         canonicalizer.canonicalize(sourceRecord.valueSchema(), sourceRecord.value());
     JsonNode canonicalKey = canonicalizer.canonicalize(sourceRecord.keySchema(), sourceRecord.key());
-    String state = evaluationState(sourceRecord, canonicalKey, canonicalValue);
+    if (sourceRecord.value() == null) {
+      publishDeadLetter(
+          sourceRecord,
+          canonicalKey,
+          canonicalValue,
+          new PermanentRecordException(
+              "STATE_BUILDING", "TOMBSTONE", "Tombstone Source Record configured for dead letter"),
+          elapsedMillis(startedAt));
+      return;
+    }
 
-    long startedAt = System.nanoTime();
+    String state;
+    try {
+      state = evaluationState(sourceRecord, canonicalKey, canonicalValue);
+      long maximumBytes = config.getLong(JevConnectorConfig.STATE_MAX_BYTES);
+      if (maximumBytes > 0 && state.getBytes(StandardCharsets.UTF_8).length > maximumBytes) {
+        throw new PermanentRecordException(
+            "STATE_BUILDING",
+            "STATE_TOO_LARGE",
+            "Evaluation State exceeds the configured byte limit",
+            state);
+      }
+    } catch (TemplateResolutionException failure) {
+      String code =
+          "Template header is not valid UTF-8".equals(failure.getMessage())
+              ? "INVALID_UTF8"
+              : "MISSING_TEMPLATE_VALUE";
+      publishDeadLetter(
+          sourceRecord,
+          canonicalKey,
+          canonicalValue,
+          new PermanentRecordException("STATE_BUILDING", code, failure.getMessage()),
+          elapsedMillis(startedAt));
+      return;
+    } catch (PermanentRecordException failure) {
+      publishDeadLetter(
+          sourceRecord, canonicalKey, canonicalValue, failure, elapsedMillis(startedAt));
+      return;
+    }
+
     InferenceResult inferenceResult = callJev(state);
-    long durationMillis = Math.max(1, (System.nanoTime() - startedAt + 999_999) / 1_000_000);
+    long durationMillis = elapsedMillis(startedAt);
     ObjectNode enriched =
         enrichedRecord(
             sourceRecord, canonicalKey, canonicalValue, state, inferenceResult, durationMillis);
@@ -93,13 +139,77 @@ public final class JevSinkTask extends SinkTask {
             sourceRecord.timestamp(),
             key,
             CanonicalJson.write(enriched));
+    publish(output, "Enriched Record");
+  }
+
+  private void publishDeadLetter(
+      SinkRecord sourceRecord,
+      JsonNode canonicalKey,
+      JsonNode canonicalValue,
+      PermanentRecordException failure,
+      long durationMillis) {
+    String sourceId = sourceId(sourceRecord);
+    String questionSetHash = DeterministicIds.questionSetHash(config.questions());
+    String statePolicyHash = statePolicyHash();
+    String requestedModel = config.getString(JevConnectorConfig.MODEL);
+    String unresolvedModel = "unresolved:" + requestedModel;
+
+    ObjectNode evaluation = CanonicalJson.MAPPER.createObjectNode();
+    evaluation.put(
+        "id",
+        DeterministicIds.evaluationId(
+            sourceId, questionSetHash, statePolicyHash, unresolvedModel));
+    evaluation.set(
+        "question_set",
+        CanonicalJson.object(
+            "id", config.getString(JevConnectorConfig.QUESTION_SET_ID), "hash", questionSetHash));
+    evaluation.set(
+        "state_policy",
+        CanonicalJson.object(
+            "mode", config.getString(JevConnectorConfig.STATE_MODE), "hash", statePolicyHash));
+    if (failure.state() != null) {
+      evaluation.set(
+          "state",
+          CanonicalJson.object("hash", DeterministicIds.evaluationStateHash(failure.state())));
+    }
+    evaluation.set(
+        "model", CanonicalJson.object("requested", requestedModel, "resolved", unresolvedModel));
+    evaluation.put("attempt_count", 0);
+    evaluation.put("duration_ms", durationMillis);
+    evaluation.put("failed_at", DateTimeFormatter.ISO_INSTANT.format(Instant.now()));
+
+    ObjectNode deadLetter = CanonicalJson.MAPPER.createObjectNode();
+    deadLetter.set("source", source(sourceRecord, canonicalKey, sourceId));
+    deadLetter.set("input", canonicalValue);
+    deadLetter.set("evaluation", evaluation);
+    deadLetter.set(
+        "error",
+        CanonicalJson.object(
+            "category", failure.category(),
+            "code", failure.code(),
+            "message", sanitize(failure.getMessage())));
+    deadLetter.set("connector", connectorProvenance());
+
+    publish(
+        new ProducerRecord<>(
+            config.getString(JevConnectorConfig.DLQ_TOPIC),
+            null,
+            sourceRecord.timestamp(),
+            sourceId,
+            CanonicalJson.write(deadLetter)),
+        "Dead-Letter Record");
+  }
+
+  private void publish(ProducerRecord<String, String> record, String recordType) {
     try {
-      producer.send(output).get();
+      producer.send(record).get();
     } catch (InterruptedException error) {
       Thread.currentThread().interrupt();
-      throw new ConnectException("Interrupted while publishing Enriched Record", error);
+      throw new ConnectException("Interrupted while publishing " + recordType, error);
     } catch (ExecutionException error) {
-      throw new ConnectException("Failed to publish Enriched Record", error.getCause());
+      throw new ConnectException("Failed to publish " + recordType, error.getCause());
+    } catch (RuntimeException error) {
+      throw new ConnectException("Failed to publish " + recordType, error);
     }
   }
 
@@ -140,31 +250,15 @@ public final class JevSinkTask extends SinkTask {
       String state,
       InferenceResult inferenceResult,
       long durationMillis) {
-    String sourceId =
-        DeterministicIds.sourceId(
-            sourceRecord.topic(), sourceRecord.kafkaPartition(), sourceRecord.kafkaOffset());
+    String sourceId = sourceId(sourceRecord);
     String questionSetHash = DeterministicIds.questionSetHash(config.questions());
-    String statePolicyHash =
-        DeterministicIds.statePolicyHash(
-            config.getString(JevConnectorConfig.STATE_MODE),
-            config.stateTemplateForHash(),
-            config.getString(JevConnectorConfig.RAW_BYTES_ENCODING));
+    String statePolicyHash = statePolicyHash();
     String resolvedModel = inferenceResult.resolvedModel();
     String evaluationId =
         DeterministicIds.evaluationId(
             sourceId, questionSetHash, statePolicyHash, resolvedModel);
 
-    ObjectNode source = CanonicalJson.MAPPER.createObjectNode();
-    source.put("id", sourceId);
-    source.put("topic", sourceRecord.topic());
-    source.put("partition", sourceRecord.kafkaPartition());
-    source.put("offset", sourceRecord.kafkaOffset());
-    if (sourceRecord.timestamp() == null) {
-      source.putNull("timestamp");
-    } else {
-      source.put("timestamp", DateTimeFormatter.ISO_INSTANT.format(Instant.ofEpochMilli(sourceRecord.timestamp())));
-    }
-    source.set("key", canonicalKey);
+    ObjectNode source = source(sourceRecord, canonicalKey, sourceId);
 
     ObjectNode evaluation = CanonicalJson.MAPPER.createObjectNode();
     evaluation.put("id", evaluationId);
@@ -189,12 +283,7 @@ public final class JevSinkTask extends SinkTask {
     enriched.set("source", source);
     enriched.set("input", canonicalValue);
     enriched.set("evaluation", evaluation);
-    enriched.set(
-        "connector",
-        CanonicalJson.object(
-            "name", config.getString(JevConnectorConfig.NAME),
-            "plugin", "kafka-jev-connector",
-            "version", Version.VALUE));
+    enriched.set("connector", connectorProvenance());
     enriched.set("jev", inferenceResult.json());
     return enriched;
   }
@@ -205,7 +294,9 @@ public final class JevSinkTask extends SinkTask {
     }
     if (isRawBytes(sourceRecord.valueSchema(), sourceRecord.value())) {
       if (!"UTF-8".equals(config.getString(JevConnectorConfig.RAW_BYTES_ENCODING))) {
-        throw new ConnectException(
+        throw new PermanentRecordException(
+            "STATE_BUILDING",
+            "RAW_BYTES_DISABLED",
             "Raw byte Evaluation State requires state.raw_bytes.encoding=UTF-8");
       }
       return decodeUtf8(sourceRecord.value());
@@ -242,7 +333,8 @@ public final class JevSinkTask extends SinkTask {
           .decode(bytes)
           .toString();
     } catch (CharacterCodingException error) {
-      throw new ConnectException("Raw byte Evaluation State is not valid UTF-8", error);
+      throw new PermanentRecordException(
+          "STATE_BUILDING", "INVALID_UTF8", "Raw byte Evaluation State is not valid UTF-8");
     }
   }
 
@@ -253,9 +345,60 @@ public final class JevSinkTask extends SinkTask {
     return CanonicalJson.serialize(value);
   }
 
+  private static long elapsedMillis(long startedAt) {
+    return Math.max(1, (System.nanoTime() - startedAt + 999_999) / 1_000_000);
+  }
+
+  private static String sanitize(String message) {
+    String sanitized =
+        message
+            .replaceAll("[\\p{Cntrl}&&[^\\r\\n\\t]]", "?")
+            .replaceAll("[\\r\\n\\t]+", " ");
+    return sanitized.length() <= 512 ? sanitized : sanitized.substring(0, 512);
+  }
+
+  private static String sourceId(SinkRecord sourceRecord) {
+    return DeterministicIds.sourceId(
+        sourceRecord.topic(), sourceRecord.kafkaPartition(), sourceRecord.kafkaOffset());
+  }
+
+  private String statePolicyHash() {
+    return DeterministicIds.statePolicyHash(
+        config.getString(JevConnectorConfig.STATE_MODE),
+        config.stateTemplateForHash(),
+        config.getString(JevConnectorConfig.RAW_BYTES_ENCODING));
+  }
+
+  private static ObjectNode source(
+      SinkRecord sourceRecord, JsonNode canonicalKey, String sourceId) {
+    ObjectNode source = CanonicalJson.MAPPER.createObjectNode();
+    source.put("id", sourceId);
+    source.put("topic", sourceRecord.topic());
+    source.put("partition", sourceRecord.kafkaPartition());
+    source.put("offset", sourceRecord.kafkaOffset());
+    if (sourceRecord.timestamp() == null) {
+      source.putNull("timestamp");
+    } else {
+      source.put(
+          "timestamp",
+          DateTimeFormatter.ISO_INSTANT.format(Instant.ofEpochMilli(sourceRecord.timestamp())));
+    }
+    source.set("key", canonicalKey);
+    return source;
+  }
+
+  private ObjectNode connectorProvenance() {
+    return CanonicalJson.object(
+        "name", config.getString(JevConnectorConfig.NAME),
+        "plugin", "kafka-jev-connector",
+        "version", Version.VALUE);
+  }
+
   private static Map<String, Object> producerProperties(JevConnectorConfig config) {
     Properties properties = new Properties();
-    properties.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, config.getString(JevConnectorConfig.OUTPUT_BOOTSTRAP));
+    properties.put(
+        ProducerConfig.BOOTSTRAP_SERVERS_CONFIG,
+        config.getString(JevConnectorConfig.OUTPUT_BOOTSTRAP));
     properties.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
     properties.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
     properties.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
