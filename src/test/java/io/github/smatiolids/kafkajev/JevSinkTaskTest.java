@@ -9,15 +9,21 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sun.net.httpserver.HttpServer;
 import java.io.IOException;
+import java.math.BigDecimal;
 import java.net.InetSocketAddress;
+import java.net.ServerSocket;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.math.BigDecimal;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Date;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.kafka.clients.producer.MockProducer;
 import org.apache.kafka.common.record.TimestampType;
@@ -37,12 +43,16 @@ class JevSinkTaskTest {
   private static final ObjectMapper JSON = new ObjectMapper();
 
   private HttpServer fakeJev;
+  private ExecutorService fakeJevExecutor;
   private final AtomicReference<String> resolvedModel = new AtomicReference<>("jev-1.13.0");
 
   @AfterEach
   void stopFakeJev() {
     if (fakeJev != null) {
       fakeJev.stop(0);
+    }
+    if (fakeJevExecutor != null) {
+      fakeJevExecutor.shutdownNow();
     }
   }
 
@@ -651,6 +661,263 @@ class JevSinkTaskTest {
     assertEquals(JSON.readTree(response), pinnedEvaluation.path("jev"));
   }
 
+  @Test
+  void retriesRateLimitingAndPublishesOnlyAggregateAttemptEvidence() throws Exception {
+    AtomicInteger attempts = new AtomicInteger();
+    fakeJev =
+        fakeJevResponses(
+            attempts,
+            List.of(
+                new FakeResponse(429, "private throttling details", "120"),
+                new FakeResponse(503, "temporary outage details", null),
+                new FakeResponse(
+                    200,
+                    "{\"model\":\"jev-1.13.0\",\"answers\":{},\"usage\":{}}",
+                    null)));
+    Map<String, String> retrying = new java.util.HashMap<>(config());
+    retrying.put("jev.retry.max.attempts", "3");
+    retrying.put("jev.retry.initial.backoff.ms", "20");
+    retrying.put("jev.retry.max.retry_after.ms", "100");
+    AtomicLong monotonicNanos = new AtomicLong();
+    List<Long> delays = new ArrayList<>();
+    MockProducer<String, String> output = output();
+    JevSinkTask task =
+        new JevSinkTask(
+            ignored -> output,
+            delay -> {
+              delays.add(delay);
+              monotonicNanos.addAndGet(delay * 1_000_000L);
+            },
+            () -> 1.25,
+            monotonicNanos::get);
+    task.start(retrying);
+
+    task.put(List.of(sourceRecord(null, "customer-42", null, "same source")));
+
+    assertEquals(3, attempts.get());
+    assertEquals(List.of(100L, 50L), delays);
+    JsonNode enriched = JSON.readTree(output.history().get(0).value());
+    assertEquals(3, enriched.at("/evaluation/attempt_count").asInt());
+    assertEquals(150, enriched.at("/evaluation/duration_ms").asLong());
+    assertFalse(output.history().get(0).value().contains("private throttling details"));
+    assertFalse(enriched.at("/evaluation").has("attempts"));
+    task.stop();
+  }
+
+  @Test
+  void retriesEveryDocumentedTransientHttpStatus() throws Exception {
+    for (int status : List.of(408, 429, 500, 502, 529, 599)) {
+      AtomicInteger attempts = new AtomicInteger();
+      fakeJev =
+          fakeJevResponses(
+              attempts,
+              List.of(
+                  new FakeResponse(status, "remote details must stay private", null),
+                  new FakeResponse(200, "{\"model\":\"jev-1.13.0\"}", null)));
+      Map<String, String> retrying = new java.util.HashMap<>(config());
+      retrying.put("jev.retry.max.attempts", "2");
+      retrying.put("jev.retry.initial.backoff.ms", "0");
+      MockProducer<String, String> output = output();
+      JevSinkTask task = new JevSinkTask(ignored -> output);
+      task.start(retrying);
+
+      task.put(List.of(sourceRecord(null, null, null, "safe")));
+
+      assertEquals(2, attempts.get(), "HTTP " + status);
+      assertEquals(
+          2,
+          JSON.readTree(output.history().get(0).value())
+              .at("/evaluation/attempt_count")
+              .asInt());
+      assertFalse(output.history().get(0).value().contains("remote details"));
+      task.stop();
+      fakeJev.stop(0);
+      fakeJev = null;
+    }
+  }
+
+  @Test
+  void failsImmediatelyForConfigurationCredentialProtocolAndUnknownStatuses() throws Exception {
+    for (int status : List.of(400, 401, 403, 404, 422, 201, 418)) {
+      AtomicInteger attempts = new AtomicInteger();
+      fakeJev =
+          fakeJevResponses(
+              attempts,
+              List.of(new FakeResponse(status, "remote secret error body", null)));
+      MockProducer<String, String> output = output();
+      JevSinkTask task = new JevSinkTask(ignored -> output);
+      task.start(config());
+
+      ConnectException failure =
+          assertThrows(
+              ConnectException.class,
+              () -> task.put(List.of(sourceRecord(null, null, null, "safe"))),
+              "HTTP " + status);
+
+      assertEquals(1, attempts.get(), "HTTP " + status);
+      assertFalse(failure.getMessage().contains("remote secret"));
+      assertEquals(0, output.history().size());
+      task.stop();
+      fakeJev.stop(0);
+      fakeJev = null;
+    }
+  }
+
+  @Test
+  void malformedJsonFailsSafelyWithoutPublishingRemoteContent() throws Exception {
+    fakeJev = fakeJevResponse(new AtomicReference<>("{malformed private response"));
+    MockProducer<String, String> output = output();
+    JevSinkTask task = new JevSinkTask(ignored -> output);
+    task.start(config());
+
+    ConnectException failure =
+        assertThrows(
+            ConnectException.class,
+            () -> task.put(List.of(sourceRecord(null, null, null, "safe"))));
+
+    assertEquals("Jev response is not valid JSON", failure.getMessage());
+    assertFalse(failure.toString().contains("private response"));
+    assertEquals(0, output.history().size());
+    task.stop();
+  }
+
+  @Test
+  void exhaustedTransientFailuresFailTheTaskByDefaultWithoutPublishing() throws Exception {
+    AtomicInteger attempts = new AtomicInteger();
+    fakeJev =
+        fakeJevResponses(
+            attempts, List.of(new FakeResponse(503, "private outage diagnostics", null)));
+    Map<String, String> exhausted = new java.util.HashMap<>(config());
+    exhausted.put("jev.retry.max.attempts", "2");
+    exhausted.put("jev.retry.initial.backoff.ms", "0");
+    MockProducer<String, String> output = output();
+    JevSinkTask task = new JevSinkTask(ignored -> output);
+    task.start(exhausted);
+
+    ConnectException failure =
+        assertThrows(
+            ConnectException.class,
+            () -> task.put(List.of(sourceRecord(null, null, null, "safe source value"))));
+
+    assertEquals("Jev Evaluation exhausted 2 transient attempts", failure.getMessage());
+    assertEquals(2, attempts.get());
+    assertEquals(0, output.history().size());
+    assertFalse(failure.toString().contains("private outage"));
+    task.stop();
+  }
+
+  @Test
+  void explicitDlqPolicyPublishesSanitizedAggregateTransientExhaustion() throws Exception {
+    AtomicInteger attempts = new AtomicInteger();
+    fakeJev =
+        fakeJevResponses(
+            attempts, List.of(new FakeResponse(503, "private outage diagnostics", null)));
+    Map<String, String> exhausted = new java.util.HashMap<>(config());
+    exhausted.put("jev.retry.max.attempts", "3");
+    exhausted.put("jev.retry.initial.backoff.ms", "10");
+    exhausted.put("errors.transient.exhausted", "DLQ");
+    AtomicLong monotonicNanos = new AtomicLong();
+    MockProducer<String, String> output = output();
+    JevSinkTask task =
+        new JevSinkTask(
+            ignored -> output,
+            delay -> monotonicNanos.addAndGet(delay * 1_000_000L),
+            () -> 1.0,
+            monotonicNanos::get);
+    task.start(exhausted);
+
+    task.put(List.of(sourceRecord(null, null, null, "safe source value")));
+
+    assertEquals(3, attempts.get());
+    assertEquals(1, output.history().size());
+    assertEquals("support-dlq", output.history().get(0).topic());
+    JsonNode deadLetter = JSON.readTree(output.history().get(0).value());
+    assertEquals("JEV_SERVICE", deadLetter.at("/error/category").asText());
+    assertEquals("TRANSIENT_EXHAUSTED", deadLetter.at("/error/code").asText());
+    assertEquals(3, deadLetter.at("/evaluation/attempt_count").asInt());
+    assertEquals(30, deadLetter.at("/evaluation/duration_ms").asLong());
+    assertEquals(
+        DeterministicIds.evaluationStateHash("safe source value"),
+        deadLetter.at("/evaluation/state/hash").asText());
+    assertFalse(output.history().get(0).value().contains("private outage"));
+    assertFalse(deadLetter.at("/evaluation").has("attempts"));
+    task.stop();
+  }
+
+  @Test
+  void jevRecordSizeRejectionIsAPermanentRecordFailure() throws Exception {
+    AtomicInteger attempts = new AtomicInteger();
+    fakeJev =
+        fakeJevResponses(
+            attempts, List.of(new FakeResponse(413, "raw service size details", null)));
+    MockProducer<String, String> output = output();
+    JevSinkTask task = new JevSinkTask(ignored -> output);
+    task.start(config());
+
+    task.put(List.of(sourceRecord(null, null, null, "safe source value")));
+
+    assertEquals(1, attempts.get());
+    JsonNode deadLetter = JSON.readTree(output.history().get(0).value());
+    assertEquals("support-dlq", output.history().get(0).topic());
+    assertEquals("RECORD_TOO_LARGE", deadLetter.at("/error/code").asText());
+    assertEquals(1, deadLetter.at("/evaluation/attempt_count").asInt());
+    assertEquals(
+        DeterministicIds.evaluationStateHash("safe source value"),
+        deadLetter.at("/evaluation/state/hash").asText());
+    assertFalse(output.history().get(0).value().contains("raw service size details"));
+    task.stop();
+  }
+
+  @Test
+  void requestTimeoutsUseTheConfiguredTotalAttemptLimit() throws Exception {
+    AtomicInteger attempts = new AtomicInteger();
+    fakeJev = slowFakeJev(attempts);
+    Map<String, String> timingOut = new java.util.HashMap<>(config());
+    timingOut.put("jev.request.timeout.ms", "25");
+    timingOut.put("jev.retry.max.attempts", "2");
+    timingOut.put("jev.retry.initial.backoff.ms", "0");
+    MockProducer<String, String> output = output();
+    JevSinkTask task = new JevSinkTask(ignored -> output);
+    task.start(timingOut);
+
+    ConnectException failure =
+        assertThrows(
+            ConnectException.class,
+            () -> task.put(List.of(sourceRecord(null, null, null, "safe"))));
+
+    assertEquals("Jev Evaluation exhausted 2 transient attempts", failure.getMessage());
+    assertEquals(2, attempts.get());
+    assertEquals(0, output.history().size());
+    task.stop();
+  }
+
+  @Test
+  void connectionFailuresAreTransientAndExhaustTheConfiguredAttemptLimit() throws Exception {
+    fakeJev = fakeJev(new AtomicReference<>());
+    Map<String, String> unavailable = new java.util.HashMap<>(config());
+    fakeJev.stop(0);
+    int unusedPort;
+    try (ServerSocket socket = new ServerSocket(0)) {
+      unusedPort = socket.getLocalPort();
+    }
+    unavailable.put("jev.endpoint", "http://127.0.0.1:" + unusedPort + "/evaluate");
+    unavailable.put("jev.connect.timeout.ms", "25");
+    unavailable.put("jev.retry.max.attempts", "2");
+    unavailable.put("jev.retry.initial.backoff.ms", "0");
+    MockProducer<String, String> output = output();
+    JevSinkTask task = new JevSinkTask(ignored -> output);
+    task.start(unavailable);
+
+    ConnectException failure =
+        assertThrows(
+            ConnectException.class,
+            () -> task.put(List.of(sourceRecord(null, null, null, "safe"))));
+
+    assertEquals("Jev Evaluation exhausted 2 transient attempts", failure.getMessage());
+    assertEquals(0, output.history().size());
+    task.stop();
+  }
+
   private JsonNode evaluate(SinkRecord source, Map<String, String> connectorConfig) throws Exception {
     MockProducer<String, String> output = output();
     JevSinkTask task = new JevSinkTask(ignored -> output);
@@ -731,6 +998,53 @@ class JevSinkTaskTest {
     server.start();
     return server;
   }
+
+  private HttpServer fakeJevResponses(AtomicInteger attempts, List<FakeResponse> responses)
+      throws IOException {
+    HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+    server.createContext(
+        "/evaluate",
+        exchange -> {
+          exchange.getRequestBody().readAllBytes();
+          int attempt = attempts.getAndIncrement();
+          FakeResponse scripted = responses.get(Math.min(attempt, responses.size() - 1));
+          byte[] response = scripted.body().getBytes(StandardCharsets.UTF_8);
+          if (scripted.retryAfter() != null) {
+            exchange.getResponseHeaders().set("Retry-After", scripted.retryAfter());
+          }
+          exchange.sendResponseHeaders(scripted.status(), response.length);
+          exchange.getResponseBody().write(response);
+          exchange.close();
+        });
+    server.start();
+    return server;
+  }
+
+  private HttpServer slowFakeJev(AtomicInteger attempts) throws IOException {
+    HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+    fakeJevExecutor = Executors.newCachedThreadPool();
+    server.setExecutor(fakeJevExecutor);
+    server.createContext(
+        "/evaluate",
+        exchange -> {
+          attempts.incrementAndGet();
+          exchange.getRequestBody().readAllBytes();
+          try {
+            Thread.sleep(250);
+            byte[] response = "{\"model\":\"jev-1.13.0\"}".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, response.length);
+            exchange.getResponseBody().write(response);
+          } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+          } finally {
+            exchange.close();
+          }
+        });
+    server.start();
+    return server;
+  }
+
+  private record FakeResponse(int status, String body, String retryAfter) {}
 
   private String endpoint() {
     return "http://127.0.0.1:" + fakeJev.getAddress().getPort() + "/evaluate";
