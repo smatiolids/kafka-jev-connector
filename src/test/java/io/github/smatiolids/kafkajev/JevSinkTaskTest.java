@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -20,12 +21,20 @@ import java.util.Date;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.producer.MockProducer;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.clients.producer.RecordMetadata;
+import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.record.TimestampType;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.apache.kafka.common.config.ConfigException;
@@ -550,6 +559,103 @@ class JevSinkTaskTest {
   }
 
   @Test
+  void pluginOwnedProducerCannotBeConfiguredToWeakenPublicationGuarantees() {
+    AtomicReference<Map<String, Object>> producerProperties = new AtomicReference<>();
+    MockProducer<String, String> output = output();
+    JevSinkTask task =
+        new JevSinkTask(
+            properties -> {
+              producerProperties.set(Map.copyOf(properties));
+              return output;
+            });
+    Map<String, String> attemptedOverrides =
+        new java.util.HashMap<>(config("http://127.0.0.1:1/evaluate"));
+    attemptedOverrides.put("producer.override.enable.idempotence", "false");
+    attemptedOverrides.put("producer.override.acks", "0");
+    attemptedOverrides.put("producer.override.key.serializer", "unsafe.KeySerializer");
+    attemptedOverrides.put("producer.override.value.serializer", "unsafe.ValueSerializer");
+    attemptedOverrides.put("producer.override.allow.auto.create.topics", "true");
+    attemptedOverrides.put("producer.override.security.protocol", "PLAINTEXT");
+
+    task.start(attemptedOverrides);
+
+    Map<String, Object> actual = producerProperties.get();
+    assertEquals(true, actual.get(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG));
+    assertEquals("all", actual.get(ProducerConfig.ACKS_CONFIG));
+    assertEquals(StringSerializer.class.getName(), actual.get(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG));
+    assertEquals(
+        StringSerializer.class.getName(), actual.get(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG));
+    assertEquals(false, actual.get("allow.auto.create.topics"));
+    assertFalse(actual.keySet().stream().anyMatch(name -> name.startsWith("producer.override.")));
+    task.stop();
+  }
+
+  @Test
+  void doesNotCompleteTheDeliveredBatchUntilItsPublicationIsAcknowledged() throws Exception {
+    ControllableProducer output = new ControllableProducer();
+    JevSinkTask task = new JevSinkTask(ignored -> output);
+    task.start(requiredTemplateConfig());
+    ExecutorService worker = Executors.newSingleThreadExecutor();
+    try {
+      Future<?> deliveredBatch =
+          worker.submit(
+              () -> task.put(List.of(sourceRecord(null, "customer-42", null, "safe value"))));
+
+      assertTrue(output.publicationAttempted.await(2, TimeUnit.SECONDS));
+      assertFalse(deliveredBatch.isDone());
+
+      assertTrue(output.completeNext());
+      deliveredBatch.get(2, TimeUnit.SECONDS);
+    } finally {
+      worker.shutdownNow();
+      task.stop();
+    }
+  }
+
+  @Test
+  void publicationFailureLeavesTheDeliveredBatchIneligibleForOffsetCommit() throws Exception {
+    MockProducer<String, String> output = output();
+    output.sendException = new RuntimeException("broker unavailable");
+    JevSinkTask task = new JevSinkTask(ignored -> output);
+    task.start(requiredTemplateConfig());
+    TopicPartition input = new TopicPartition("support-input", 2);
+    Map<TopicPartition, OffsetAndMetadata> deliveredOffsets =
+        Map.of(input, new OffsetAndMetadata(185));
+
+    assertThrows(
+        ConnectException.class,
+        () -> task.put(List.of(sourceRecord(null, "customer-42", null, "safe value"))));
+
+    assertEquals(Map.of(), task.preCommit(deliveredOffsets));
+
+    output.sendException = null;
+    task.put(List.of(sourceRecord(null, "customer-42", null, "safe value")));
+    assertEquals(deliveredOffsets, task.preCommit(deliveredOffsets));
+    task.stop();
+  }
+
+  @Test
+  void enrichedPublicationFailureAlsoLeavesTheDeliveredBatchIneligibleForOffsetCommit()
+      throws Exception {
+    fakeJev = fakeJev(new AtomicReference<>());
+    MockProducer<String, String> output = output();
+    output.sendException = new RuntimeException("broker unavailable");
+    JevSinkTask task = new JevSinkTask(ignored -> output);
+    task.start(config());
+    Map<TopicPartition, OffsetAndMetadata> deliveredOffsets =
+        Map.of(new TopicPartition("support-input", 2), new OffsetAndMetadata(185));
+
+    ConnectException failure =
+        assertThrows(
+            ConnectException.class,
+            () -> task.put(List.of(sourceRecord(null, "customer-42", null, "safe value"))));
+
+    assertEquals("Failed to publish Enriched Record", failure.getMessage());
+    assertEquals(Map.of(), task.preCommit(deliveredOffsets));
+    task.stop();
+  }
+
+  @Test
   void replayAndEquivalentConfigurationKeepIdentityWhileEffectiveChangesCreateANewEvaluation()
       throws Exception {
     AtomicReference<JsonNode> receivedRequest = new AtomicReference<>();
@@ -945,7 +1051,26 @@ class JevSinkTaskTest {
     return new MockProducer<>(true, null, new StringSerializer(), new StringSerializer());
   }
 
+  private static final class ControllableProducer extends MockProducer<String, String> {
+    private final CountDownLatch publicationAttempted = new CountDownLatch(1);
+
+    private ControllableProducer() {
+      super(false, null, new StringSerializer(), new StringSerializer());
+    }
+
+    @Override
+    public synchronized Future<RecordMetadata> send(ProducerRecord<String, String> record) {
+      Future<RecordMetadata> publication = super.send(record);
+      publicationAttempted.countDown();
+      return publication;
+    }
+  }
+
   private Map<String, String> config() {
+    return config(endpoint());
+  }
+
+  private Map<String, String> config(String endpoint) {
     return Map.ofEntries(
         Map.entry("name", "support-evaluator"),
         Map.entry("topics", "support-input"),
@@ -958,9 +1083,17 @@ class JevSinkTaskTest {
             "{\"department\":{\"type\":\"choice\",\"instructions\":\"Route it\"}}"),
         Map.entry("state.mode", "FULL_VALUE"),
         Map.entry("jev.model", "jev-latest"),
-        Map.entry("jev.endpoint", endpoint()),
+        Map.entry("jev.endpoint", endpoint),
         Map.entry("jev.allow.insecure.http", "true"),
         Map.entry("output.bootstrap.servers", "unused:9092"));
+  }
+
+  private Map<String, String> requiredTemplateConfig() {
+    Map<String, String> required =
+        new java.util.HashMap<>(config("http://127.0.0.1:1/evaluate"));
+    required.put("state.mode", "TEMPLATE");
+    required.put("state.template", "approved=${value:/approved}");
+    return required;
   }
 
   private HttpServer fakeJev(AtomicReference<JsonNode> receivedRequest) throws IOException {
