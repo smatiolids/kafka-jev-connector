@@ -648,6 +648,46 @@ class JevSinkTaskTest {
   }
 
   @Test
+  void templateWholeValueAppliesTheRawBytesPolicyAndStrictUtf8Decoding() throws Exception {
+    AtomicReference<JsonNode> receivedRequest = new AtomicReference<>();
+    fakeJev = fakeJev(receivedRequest);
+    Map<String, String> template = new java.util.HashMap<>(config());
+    template.put("state.mode", "TEMPLATE");
+    template.put("state.template", "payload=${value}");
+
+    MockProducer<String, String> disabledOutput = output();
+    JevSinkTask disabled = new JevSinkTask(ignored -> disabledOutput);
+    disabled.start(template);
+    disabled.put(
+        List.of(
+            sourceRecord(
+                null, null, Schema.BYTES_SCHEMA, "private".getBytes(StandardCharsets.UTF_8))));
+    assertEquals(
+        "RAW_BYTES_DISABLED",
+        JSON.readTree(disabledOutput.history().get(0).value()).at("/error/code").asText());
+    assertEquals(null, receivedRequest.get());
+    disabled.stop();
+
+    template.put("state.raw_bytes.encoding", "UTF-8");
+    MockProducer<String, String> enabledOutput = output();
+    JevSinkTask enabled = new JevSinkTask(ignored -> enabledOutput);
+    enabled.start(template);
+    enabled.put(
+        List.of(
+            sourceRecord(
+                null, null, Schema.BYTES_SCHEMA, "Olá".getBytes(StandardCharsets.UTF_8))));
+    assertEquals("payload=Olá", receivedRequest.get().path("state").asText());
+
+    enabled.put(
+        List.of(
+            sourceRecord(null, null, Schema.BYTES_SCHEMA, new byte[] {(byte) 0xc3, 0x28})));
+    assertEquals(
+        "INVALID_UTF8",
+        JSON.readTree(enabledOutput.history().get(1).value()).at("/error/code").asText());
+    enabled.stop();
+  }
+
+  @Test
   void deadLettersEvaluationStateThatExceedsTheConfiguredUtf8ByteLimit() throws Exception {
     AtomicReference<JsonNode> receivedRequest = new AtomicReference<>();
     fakeJev = fakeJev(receivedRequest);

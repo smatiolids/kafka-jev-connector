@@ -5,8 +5,6 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
-import java.nio.charset.CodingErrorAction;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
@@ -53,10 +51,10 @@ final class CompiledStateTemplate {
     return new CompiledStateTemplate(segments);
   }
 
-  String render(SinkRecord record, JsonNode key, JsonNode value) {
+  String render(SinkRecord record, JsonNode key, JsonNode value, boolean rawBytesUtf8) {
     StringBuilder state = new StringBuilder();
     for (Segment segment : segments) {
-      segment.append(state, record, key, value);
+      segment.append(state, record, key, value, rawBytesUtf8);
     }
     return state.toString();
   }
@@ -189,12 +187,22 @@ final class CompiledStateTemplate {
   }
 
   private sealed interface Segment permits Literal, Reference {
-    void append(StringBuilder target, SinkRecord record, JsonNode key, JsonNode value);
+    void append(
+        StringBuilder target,
+        SinkRecord record,
+        JsonNode key,
+        JsonNode value,
+        boolean rawBytesUtf8);
   }
 
   private record Literal(String text) implements Segment {
     @Override
-    public void append(StringBuilder target, SinkRecord record, JsonNode key, JsonNode value) {
+    public void append(
+        StringBuilder target,
+        SinkRecord record,
+        JsonNode key,
+        JsonNode value,
+        boolean rawBytesUtf8) {
       target.append(text);
     }
   }
@@ -203,9 +211,22 @@ final class CompiledStateTemplate {
       String source, JsonPointer pointer, String name, boolean hasDefault, String defaultValue)
       implements Segment {
     @Override
-    public void append(StringBuilder target, SinkRecord record, JsonNode key, JsonNode value) {
+    public void append(
+        StringBuilder target,
+        SinkRecord record,
+        JsonNode key,
+        JsonNode value,
+        boolean rawBytesUtf8) {
       JsonNode resolved;
       try {
+        if (pointer == null && source.equals("value") && isRawBytes(record.value())) {
+          target.append(rawState(record.value(), rawBytesUtf8));
+          return;
+        }
+        if (pointer == null && source.equals("key") && isRawBytes(record.key())) {
+          target.append(rawState(record.key(), rawBytesUtf8));
+          return;
+        }
         resolved = resolve(record, key, value);
       } catch (InvalidHeaderUtf8 error) {
         if (hasDefault) {
@@ -264,15 +285,24 @@ final class CompiledStateTemplate {
 
     private static String decodeUtf8(ByteBuffer bytes) {
       try {
-        return StandardCharsets.UTF_8
-            .newDecoder()
-            .onMalformedInput(CodingErrorAction.REPORT)
-            .onUnmappableCharacter(CodingErrorAction.REPORT)
-            .decode(bytes)
-            .toString();
+        return StrictUtf8.decode(bytes);
       } catch (CharacterCodingException error) {
         throw new InvalidHeaderUtf8(error);
       }
+    }
+
+    private static boolean isRawBytes(Object value) {
+      return value instanceof byte[] || value instanceof ByteBuffer;
+    }
+
+    private static String rawState(Object value, boolean rawBytesUtf8) {
+      if (!rawBytesUtf8) {
+        throw new PermanentRecordException(
+            "STATE_BUILDING",
+            "RAW_BYTES_DISABLED",
+            "Raw byte Evaluation State requires state.raw_bytes.encoding=UTF-8");
+      }
+      return StrictUtf8.decodeRawState(value);
     }
 
     private static String renderValue(JsonNode node) {

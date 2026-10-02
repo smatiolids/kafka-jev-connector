@@ -9,8 +9,6 @@ import java.net.http.HttpHeaders;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.ByteBuffer;
-import java.nio.charset.CharacterCodingException;
-import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
@@ -558,7 +556,7 @@ public final class JevSinkTask extends SinkTask {
             "RAW_BYTES_DISABLED",
             "Raw byte Evaluation State requires state.raw_bytes.encoding=UTF-8");
       }
-      return decodeUtf8(sourceRecord.value());
+      return StrictUtf8.decodeRawState(sourceRecord.value());
     }
     return render(canonicalValue);
   }
@@ -566,7 +564,13 @@ public final class JevSinkTask extends SinkTask {
   private String evaluationState(
       SinkRecord sourceRecord, JsonNode canonicalKey, JsonNode canonicalValue) {
     if (config.stateTemplate() != null) {
-      return config.stateTemplate().render(sourceRecord, canonicalKey, canonicalValue);
+      return config
+          .stateTemplate()
+          .render(
+              sourceRecord,
+              canonicalKey,
+              canonicalValue,
+              "UTF-8".equals(config.getString(JevConnectorConfig.RAW_BYTES_ENCODING)));
     }
     return fullValueState(sourceRecord, canonicalValue);
   }
@@ -575,26 +579,6 @@ public final class JevSinkTask extends SinkTask {
     return (schema != null && schema.type() == Schema.Type.BYTES)
         || value instanceof byte[]
         || value instanceof ByteBuffer;
-  }
-
-  private static String decodeUtf8(Object value) {
-    ByteBuffer bytes;
-    if (value instanceof byte[] array) {
-      bytes = ByteBuffer.wrap(array);
-    } else {
-      bytes = ((ByteBuffer) value).duplicate();
-    }
-    try {
-      return StandardCharsets.UTF_8
-          .newDecoder()
-          .onMalformedInput(CodingErrorAction.REPORT)
-          .onUnmappableCharacter(CodingErrorAction.REPORT)
-          .decode(bytes)
-          .toString();
-    } catch (CharacterCodingException error) {
-      throw new PermanentRecordException(
-          "STATE_BUILDING", "INVALID_UTF8", "Raw byte Evaluation State is not valid UTF-8");
-    }
   }
 
   private static String render(JsonNode value) {
