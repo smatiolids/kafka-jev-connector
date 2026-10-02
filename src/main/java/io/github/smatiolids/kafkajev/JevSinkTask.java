@@ -17,10 +17,15 @@ import java.time.Instant;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.DoubleSupplier;
 import java.util.function.Function;
@@ -48,6 +53,7 @@ public final class JevSinkTask extends SinkTask {
   private JevConnectorConfig config;
   private Producer<String, String> producer;
   private HttpClient http;
+  private ExecutorService batchWorkers;
   private volatile boolean batchFailed;
 
   public JevSinkTask() {
@@ -77,6 +83,8 @@ public final class JevSinkTask extends SinkTask {
   public void start(Map<String, String> properties) {
     config = new JevConnectorConfig(properties);
     producer = producerFactory.apply(producerProperties(config));
+    batchWorkers =
+        Executors.newFixedThreadPool(config.getInt(JevConnectorConfig.MAX_IN_FLIGHT));
     http =
         HttpClient.newBuilder()
             .connectTimeout(
@@ -89,8 +97,42 @@ public final class JevSinkTask extends SinkTask {
   public void put(Collection<SinkRecord> records) {
     batchFailed = false;
     try {
+      List<Future<?>> outcomes = new ArrayList<>(records.size());
       for (SinkRecord sourceRecord : records) {
-        evaluateAndPublish(sourceRecord);
+        outcomes.add(batchWorkers.submit(() -> evaluateAndPublish(sourceRecord)));
+      }
+      RuntimeException firstFailure = null;
+      boolean interrupted = false;
+      for (Future<?> outcome : outcomes) {
+        boolean completed = false;
+        while (!completed) {
+          try {
+            outcome.get();
+            completed = true;
+          } catch (InterruptedException interruption) {
+            interrupted = true;
+            if (firstFailure == null) {
+              firstFailure =
+                  new ConnectException(
+                      "Interrupted while processing Source Record batch", interruption);
+            }
+          } catch (ExecutionException failedRecord) {
+            completed = true;
+            if (firstFailure == null) {
+              Throwable cause = failedRecord.getCause();
+              firstFailure =
+                  cause instanceof RuntimeException runtime
+                      ? runtime
+                      : new ConnectException("Failed to process Source Record batch", cause);
+            }
+          }
+        }
+      }
+      if (interrupted) {
+        Thread.currentThread().interrupt();
+      }
+      if (firstFailure != null) {
+        throw firstFailure;
       }
     } catch (RuntimeException failure) {
       batchFailed = true;
@@ -106,6 +148,9 @@ public final class JevSinkTask extends SinkTask {
 
   @Override
   public void stop() {
+    if (batchWorkers != null) {
+      batchWorkers.shutdownNow();
+    }
     if (producer != null) {
       producer.close();
     }
