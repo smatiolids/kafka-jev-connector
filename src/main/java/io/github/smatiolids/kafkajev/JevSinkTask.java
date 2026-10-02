@@ -1,25 +1,21 @@
 package io.github.smatiolids.kafkajev;
 
 import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.MapperFeature;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.SerializationFeature;
-import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.format.DateTimeFormatter;
 import java.util.Collection;
-import java.util.HexFormat;
 import java.util.Map;
 import java.util.Properties;
-import java.util.TreeMap;
 import java.util.concurrent.ExecutionException;
 import java.util.function.Function;
 import org.apache.kafka.clients.producer.KafkaProducer;
@@ -27,15 +23,14 @@ import org.apache.kafka.clients.producer.Producer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.serialization.StringSerializer;
+import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.apache.kafka.connect.sink.SinkTask;
 
 public final class JevSinkTask extends SinkTask {
-  private static final ObjectMapper JSON =
-      JsonMapperFactory.create();
-
   private final Function<Map<String, Object>, Producer<String, String>> producerFactory;
+  private final ConnectValueCanonicalizer canonicalizer = new ConnectValueCanonicalizer();
   private JevConnectorConfig config;
   private Producer<String, String> producer;
   private HttpClient http;
@@ -79,22 +74,25 @@ public final class JevSinkTask extends SinkTask {
   }
 
   private void evaluateAndPublish(SinkRecord sourceRecord) {
-    if (!(sourceRecord.value() instanceof String state)) {
-      throw new ConnectException("FULL_VALUE currently requires a string Source Record value");
-    }
+    JsonNode canonicalValue =
+        canonicalizer.canonicalize(sourceRecord.valueSchema(), sourceRecord.value());
+    JsonNode canonicalKey = canonicalizer.canonicalize(sourceRecord.keySchema(), sourceRecord.key());
+    String state = fullValueState(sourceRecord, canonicalValue);
 
     long startedAt = System.nanoTime();
     JsonNode inferenceResult = callJev(state);
     long durationMillis = Math.max(1, (System.nanoTime() - startedAt + 999_999) / 1_000_000);
-    ObjectNode enriched = enrichedRecord(sourceRecord, state, inferenceResult, durationMillis);
-    String key = sourceRecord.key() == null ? null : String.valueOf(sourceRecord.key());
+    ObjectNode enriched =
+        enrichedRecord(
+            sourceRecord, canonicalKey, canonicalValue, state, inferenceResult, durationMillis);
+    String key = sourceRecord.key() == null ? null : render(canonicalKey);
     ProducerRecord<String, String> output =
         new ProducerRecord<>(
             config.getString(JevConnectorConfig.OUTPUT_TOPIC),
             null,
             sourceRecord.timestamp(),
             key,
-            write(enriched));
+            CanonicalJson.write(enriched));
     try {
       producer.send(output).get();
     } catch (InterruptedException error) {
@@ -106,7 +104,7 @@ public final class JevSinkTask extends SinkTask {
   }
 
   private JsonNode callJev(String state) {
-    ObjectNode requestBody = JSON.createObjectNode();
+    ObjectNode requestBody = CanonicalJson.MAPPER.createObjectNode();
     requestBody.put("state", state);
     requestBody.set("questions", config.questions());
     requestBody.put("model", config.getString(JevConnectorConfig.MODEL));
@@ -115,14 +113,16 @@ public final class JevSinkTask extends SinkTask {
             .timeout(Duration.ofSeconds(10))
             .header("Authorization", "Bearer " + config.getPassword(JevConnectorConfig.API_KEY).value())
             .header("Content-Type", "application/json")
-            .POST(HttpRequest.BodyPublishers.ofString(write(requestBody), StandardCharsets.UTF_8))
+            .POST(
+                HttpRequest.BodyPublishers.ofString(
+                    CanonicalJson.write(requestBody), StandardCharsets.UTF_8))
             .build();
     try {
       HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
       if (response.statusCode() != 200) {
         throw new ConnectException("Jev returned HTTP " + response.statusCode());
       }
-      JsonNode result = JSON.readTree(response.body());
+      JsonNode result = CanonicalJson.MAPPER.readTree(response.body());
       JsonNode resolvedModel = result.path("model");
       if (!result.isObject() || !resolvedModel.isTextual() || resolvedModel.asText().isBlank()) {
         throw new ConnectException("Jev response must be a JSON object with a usable model");
@@ -139,27 +139,27 @@ public final class JevSinkTask extends SinkTask {
   }
 
   private ObjectNode enrichedRecord(
-      SinkRecord sourceRecord, String state, JsonNode inferenceResult, long durationMillis) {
+      SinkRecord sourceRecord,
+      JsonNode canonicalKey,
+      JsonNode canonicalValue,
+      String state,
+      JsonNode inferenceResult,
+      long durationMillis) {
     String sourceId =
-        hash(
-            object(
-                "topic", sourceRecord.topic(),
-                "partition", sourceRecord.kafkaPartition(),
-                "offset", sourceRecord.kafkaOffset()));
-    String questionSetHash = hash(config.questions());
-    JsonNode statePolicy =
-        object("mode", "FULL_VALUE", "template", null, "raw_bytes_encoding", "DISABLED");
-    String statePolicyHash = hash(statePolicy);
+        DeterministicIds.sourceId(
+            sourceRecord.topic(), sourceRecord.kafkaPartition(), sourceRecord.kafkaOffset());
+    String questionSetHash = DeterministicIds.questionSetHash(config.questions());
+    String statePolicyHash =
+        DeterministicIds.statePolicyHash(
+            config.getString(JevConnectorConfig.STATE_MODE),
+            null,
+            config.getString(JevConnectorConfig.RAW_BYTES_ENCODING));
     String resolvedModel = inferenceResult.path("model").asText();
     String evaluationId =
-        hash(
-            object(
-                "source_id", sourceId,
-                "question_set_hash", questionSetHash,
-                "state_policy_hash", statePolicyHash,
-                "effective_model", resolvedModel));
+        DeterministicIds.evaluationId(
+            sourceId, questionSetHash, statePolicyHash, resolvedModel);
 
-    ObjectNode source = JSON.createObjectNode();
+    ObjectNode source = CanonicalJson.MAPPER.createObjectNode();
     source.put("id", sourceId);
     source.put("topic", sourceRecord.topic());
     source.put("partition", sourceRecord.kafkaPartition());
@@ -169,39 +169,85 @@ public final class JevSinkTask extends SinkTask {
     } else {
       source.put("timestamp", DateTimeFormatter.ISO_INSTANT.format(Instant.ofEpochMilli(sourceRecord.timestamp())));
     }
-    if (sourceRecord.key() == null) {
-      source.putNull("key");
-    } else {
-      source.put("key", String.valueOf(sourceRecord.key()));
-    }
+    source.set("key", canonicalKey);
 
-    ObjectNode evaluation = JSON.createObjectNode();
+    ObjectNode evaluation = CanonicalJson.MAPPER.createObjectNode();
     evaluation.put("id", evaluationId);
     evaluation.set(
         "question_set",
-        object("id", config.getString(JevConnectorConfig.QUESTION_SET_ID), "hash", questionSetHash));
-    evaluation.set("state_policy", object("mode", "FULL_VALUE", "hash", statePolicyHash));
-    evaluation.set("state", object("hash", hashText(state)));
+        CanonicalJson.object(
+            "id", config.getString(JevConnectorConfig.QUESTION_SET_ID), "hash", questionSetHash));
+    evaluation.set(
+        "state_policy",
+        CanonicalJson.object(
+            "mode", config.getString(JevConnectorConfig.STATE_MODE), "hash", statePolicyHash));
+    evaluation.set("state", CanonicalJson.object("hash", DeterministicIds.evaluationStateHash(state)));
     evaluation.set(
         "model",
-        object(
+        CanonicalJson.object(
             "requested", config.getString(JevConnectorConfig.MODEL), "resolved", resolvedModel));
     evaluation.put("attempt_count", 1);
     evaluation.put("duration_ms", durationMillis);
     evaluation.put("completed_at", DateTimeFormatter.ISO_INSTANT.format(Instant.now()));
 
-    ObjectNode enriched = JSON.createObjectNode();
+    ObjectNode enriched = CanonicalJson.MAPPER.createObjectNode();
     enriched.set("source", source);
-    enriched.put("input", state);
+    enriched.set("input", canonicalValue);
     enriched.set("evaluation", evaluation);
     enriched.set(
         "connector",
-        object(
+        CanonicalJson.object(
             "name", config.getString(JevConnectorConfig.NAME),
             "plugin", "kafka-jev-connector",
             "version", Version.VALUE));
     enriched.set("jev", inferenceResult);
     return enriched;
+  }
+
+  private String fullValueState(SinkRecord sourceRecord, JsonNode canonicalValue) {
+    if (sourceRecord.value() == null) {
+      throw new ConnectException("Null Source Record values require a configured tombstone policy");
+    }
+    if (isRawBytes(sourceRecord.valueSchema(), sourceRecord.value())) {
+      if (!"UTF-8".equals(config.getString(JevConnectorConfig.RAW_BYTES_ENCODING))) {
+        throw new ConnectException(
+            "Raw byte Evaluation State requires state.raw_bytes.encoding=UTF-8");
+      }
+      return decodeUtf8(sourceRecord.value());
+    }
+    return render(canonicalValue);
+  }
+
+  private static boolean isRawBytes(Schema schema, Object value) {
+    return (schema != null && schema.type() == Schema.Type.BYTES)
+        || value instanceof byte[]
+        || value instanceof ByteBuffer;
+  }
+
+  private static String decodeUtf8(Object value) {
+    ByteBuffer bytes;
+    if (value instanceof byte[] array) {
+      bytes = ByteBuffer.wrap(array);
+    } else {
+      bytes = ((ByteBuffer) value).duplicate();
+    }
+    try {
+      return StandardCharsets.UTF_8
+          .newDecoder()
+          .onMalformedInput(CodingErrorAction.REPORT)
+          .onUnmappableCharacter(CodingErrorAction.REPORT)
+          .decode(bytes)
+          .toString();
+    } catch (CharacterCodingException error) {
+      throw new ConnectException("Raw byte Evaluation State is not valid UTF-8", error);
+    }
+  }
+
+  private static String render(JsonNode value) {
+    if (value.isTextual()) {
+      return value.textValue();
+    }
+    return CanonicalJson.serialize(value);
   }
 
   private static Map<String, Object> producerProperties(JevConnectorConfig config) {
@@ -217,69 +263,4 @@ public final class JevSinkTask extends SinkTask {
     return result;
   }
 
-  private static ObjectNode object(Object... values) {
-    ObjectNode object = JSON.createObjectNode();
-    for (int index = 0; index < values.length; index += 2) {
-      String name = (String) values[index];
-      Object value = values[index + 1];
-      if (value == null) {
-        object.putNull(name);
-      } else if (value instanceof Integer integer) {
-        object.put(name, integer);
-      } else if (value instanceof Long longValue) {
-        object.put(name, longValue);
-      } else {
-        object.put(name, String.valueOf(value));
-      }
-    }
-    return object;
-  }
-
-  private static String hash(JsonNode value) {
-    return hashText(write(canonicalize(value)));
-  }
-
-  private static JsonNode canonicalize(JsonNode value) {
-    if (value.isObject()) {
-      ObjectNode sorted = JSON.createObjectNode();
-      TreeMap<String, JsonNode> fields = new TreeMap<>();
-      value.fields().forEachRemaining(entry -> fields.put(entry.getKey(), entry.getValue()));
-      fields.forEach((name, child) -> sorted.set(name, canonicalize(child)));
-      return sorted;
-    }
-    if (value.isArray()) {
-      ArrayNode array = JSON.createArrayNode();
-      value.forEach(child -> array.add(canonicalize(child)));
-      return array;
-    }
-    return value;
-  }
-
-  private static String hashText(String value) {
-    try {
-      byte[] digest = MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8));
-      return "sha256:" + HexFormat.of().formatHex(digest);
-    } catch (Exception error) {
-      throw new IllegalStateException("SHA-256 is unavailable", error);
-    }
-  }
-
-  private static String write(JsonNode value) {
-    try {
-      return JSON.writeValueAsString(value);
-    } catch (Exception error) {
-      throw new ConnectException("Could not serialize JSON", error);
-    }
-  }
-
-  private static final class JsonMapperFactory {
-    private JsonMapperFactory() {}
-
-    private static ObjectMapper create() {
-      ObjectMapper mapper = new ObjectMapper();
-      mapper.configure(MapperFeature.SORT_PROPERTIES_ALPHABETICALLY, true);
-      mapper.configure(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS, true);
-      return mapper;
-    }
-  }
 }

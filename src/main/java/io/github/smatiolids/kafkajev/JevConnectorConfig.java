@@ -20,6 +20,7 @@ final class JevConnectorConfig extends AbstractConfig {
   static final String API_KEY = "jev.api.key";
   static final String QUESTIONS = "jev.questions";
   static final String STATE_MODE = "state.mode";
+  static final String RAW_BYTES_ENCODING = "state.raw_bytes.encoding";
   static final String ENDPOINT = "jev.endpoint";
   static final String ALLOW_HTTP = "jev.allow.insecure.http";
   static final String MODEL = "jev.model";
@@ -43,6 +44,13 @@ final class JevConnectorConfig extends AbstractConfig {
               ConfigDef.ValidString.in("FULL_VALUE"),
               ConfigDef.Importance.HIGH,
               "Evaluation State policy")
+          .define(
+              RAW_BYTES_ENCODING,
+              ConfigDef.Type.STRING,
+              "DISABLED",
+              ConfigDef.ValidString.in("DISABLED", "UTF-8"),
+              ConfigDef.Importance.MEDIUM,
+              "Raw byte Evaluation State encoding")
           .define(
               ENDPOINT,
               ConfigDef.Type.STRING,
