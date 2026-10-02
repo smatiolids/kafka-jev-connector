@@ -115,8 +115,8 @@ Kafka Connect values are represented as follows:
 - Dates become `YYYY-MM-DD` strings.
 - Times become ISO local-time strings.
 - Timestamps become ISO-8601 UTC instants.
-- Bytes become Base64 strings with a type marker.
-- Maps with non-string keys become arrays of `{ "key": ..., "value": ... }` entries with a type marker.
+- Bytes become `{ "$type": "bytes", "base64": "..." }`, where `base64` uses the standard padded Base64 alphabet.
+- Maps with non-string keys become `{ "$type": "map", "entries": [{ "key": ..., "value": ... }] }`. Entries are ordered by the canonical JSON text of the key, then the value, so map iteration order cannot change the result.
 - Structs become objects using their schema field names.
 - Integers, floating-point values, booleans, strings, lists, and string-keyed maps use their natural JSON forms.
 
