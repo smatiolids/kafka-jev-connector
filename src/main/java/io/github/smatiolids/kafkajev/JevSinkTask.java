@@ -80,7 +80,7 @@ public final class JevSinkTask extends SinkTask {
     String state = fullValueState(sourceRecord, canonicalValue);
 
     long startedAt = System.nanoTime();
-    JsonNode inferenceResult = callJev(state);
+    InferenceResult inferenceResult = callJev(state);
     long durationMillis = Math.max(1, (System.nanoTime() - startedAt + 999_999) / 1_000_000);
     ObjectNode enriched =
         enrichedRecord(
@@ -103,7 +103,7 @@ public final class JevSinkTask extends SinkTask {
     }
   }
 
-  private JsonNode callJev(String state) {
+  private InferenceResult callJev(String state) {
     ObjectNode requestBody = CanonicalJson.MAPPER.createObjectNode();
     requestBody.put("state", state);
     requestBody.set("questions", config.questions());
@@ -122,12 +122,7 @@ public final class JevSinkTask extends SinkTask {
       if (response.statusCode() != 200) {
         throw new ConnectException("Jev returned HTTP " + response.statusCode());
       }
-      JsonNode result = CanonicalJson.MAPPER.readTree(response.body());
-      JsonNode resolvedModel = result.path("model");
-      if (!result.isObject() || !resolvedModel.isTextual() || resolvedModel.asText().isBlank()) {
-        throw new ConnectException("Jev response must be a JSON object with a usable model");
-      }
-      return result;
+      return InferenceResult.from(CanonicalJson.MAPPER.readTree(response.body()));
     } catch (InterruptedException error) {
       Thread.currentThread().interrupt();
       throw new ConnectException("Interrupted while calling Jev", error);
@@ -143,7 +138,7 @@ public final class JevSinkTask extends SinkTask {
       JsonNode canonicalKey,
       JsonNode canonicalValue,
       String state,
-      JsonNode inferenceResult,
+      InferenceResult inferenceResult,
       long durationMillis) {
     String sourceId =
         DeterministicIds.sourceId(
@@ -154,7 +149,7 @@ public final class JevSinkTask extends SinkTask {
             config.getString(JevConnectorConfig.STATE_MODE),
             null,
             config.getString(JevConnectorConfig.RAW_BYTES_ENCODING));
-    String resolvedModel = inferenceResult.path("model").asText();
+    String resolvedModel = inferenceResult.resolvedModel();
     String evaluationId =
         DeterministicIds.evaluationId(
             sourceId, questionSetHash, statePolicyHash, resolvedModel);
@@ -200,7 +195,7 @@ public final class JevSinkTask extends SinkTask {
             "name", config.getString(JevConnectorConfig.NAME),
             "plugin", "kafka-jev-connector",
             "version", Version.VALUE));
-    enriched.set("jev", inferenceResult);
+    enriched.set("jev", inferenceResult.json());
     return enriched;
   }
 
