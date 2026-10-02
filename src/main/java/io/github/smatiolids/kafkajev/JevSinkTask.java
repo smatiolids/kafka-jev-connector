@@ -193,11 +193,11 @@ public final class JevSinkTask extends SinkTask {
 
   private void evaluateAndPublish(SinkRecord sourceRecord) {
     if (sourceRecord.value() == null
-        && "IGNORE".equals(config.getString(JevConnectorConfig.TOMBSTONE_BEHAVIOR))) {
+        && config.tombstoneBehavior() == JevConnectorConfig.TombstoneBehavior.IGNORE) {
       return;
     }
     if (sourceRecord.value() == null
-        && "FAIL".equals(config.getString(JevConnectorConfig.TOMBSTONE_BEHAVIOR))) {
+        && config.tombstoneBehavior() == JevConnectorConfig.TombstoneBehavior.FAIL) {
       throw new ConnectException("Tombstone Source Record configured to fail the task");
     }
     long startedAt = monotonicNanos.getAsLong();
@@ -263,7 +263,7 @@ public final class JevSinkTask extends SinkTask {
             success.attemptCount(),
             durationMillis);
     String key =
-        "EVALUATION_ID".equals(config.getString(JevConnectorConfig.OUTPUT_KEY_MODE))
+        config.outputKeyMode() == JevConnectorConfig.OutputKeyMode.EVALUATION_ID
             ? enriched.at("/evaluation/id").asText()
             : sourceRecord.key() == null ? null : render(canonicalKey);
     ProducerRecord<String, String> output =
@@ -304,7 +304,7 @@ public final class JevSinkTask extends SinkTask {
     evaluation.set(
         "state_policy",
         CanonicalJson.object(
-            "mode", config.getString(JevConnectorConfig.STATE_MODE), "hash", statePolicyHash));
+            "mode", config.stateMode().name(), "hash", statePolicyHash));
     if (failure.state() != null) {
       evaluation.set(
           "state",
@@ -342,7 +342,7 @@ public final class JevSinkTask extends SinkTask {
   private RecordHeaders enrichedHeaders(
       SinkRecord sourceRecord, String evaluationId, String resolvedModel) {
     RecordHeaders headers = new RecordHeaders();
-    if ("COPY".equals(config.getString(JevConnectorConfig.OUTPUT_HEADERS_MODE))) {
+    if (config.outputHeadersMode() == JevConnectorConfig.OutputHeadersMode.COPY) {
       sourceRecord.headers().forEach(header -> headers.add(header.key(), outputHeaderValue(header)));
     }
     headers.add(EVALUATION_ID_HEADER, evaluationId.getBytes(StandardCharsets.UTF_8));
@@ -436,7 +436,8 @@ public final class JevSinkTask extends SinkTask {
       }
 
       if (attempt == maximumAttempts) {
-        if ("DLQ".equals(config.getString(JevConnectorConfig.TRANSIENT_EXHAUSTED))) {
+        if (config.transientExhaustedBehavior()
+            == JevConnectorConfig.TransientExhaustedBehavior.DLQ) {
           throw new PermanentRecordException(
               "JEV_SERVICE",
               "TRANSIENT_EXHAUSTED",
@@ -553,7 +554,7 @@ public final class JevSinkTask extends SinkTask {
     evaluation.set(
         "state_policy",
         CanonicalJson.object(
-            "mode", config.getString(JevConnectorConfig.STATE_MODE), "hash", statePolicyHash));
+            "mode", config.stateMode().name(), "hash", statePolicyHash));
     evaluation.set("state", CanonicalJson.object("hash", DeterministicIds.evaluationStateHash(state)));
     evaluation.set(
         "model",
@@ -577,7 +578,7 @@ public final class JevSinkTask extends SinkTask {
       throw new ConnectException("Null Source Record values require a configured tombstone policy");
     }
     if (isRawBytes(sourceRecord.valueSchema(), sourceRecord.value())) {
-      if (!"UTF-8".equals(config.getString(JevConnectorConfig.RAW_BYTES_ENCODING))) {
+      if (config.rawBytesEncoding() != JevConnectorConfig.RawBytesEncoding.UTF8) {
         throw new PermanentRecordException(
             "STATE_BUILDING",
             "RAW_BYTES_DISABLED",
@@ -597,7 +598,7 @@ public final class JevSinkTask extends SinkTask {
               sourceRecord,
               canonicalKey,
               canonicalValue,
-              "UTF-8".equals(config.getString(JevConnectorConfig.RAW_BYTES_ENCODING)));
+              config.rawBytesEncoding());
     }
     return fullValueState(sourceRecord, canonicalValue);
   }
@@ -634,9 +635,9 @@ public final class JevSinkTask extends SinkTask {
 
   private String statePolicyHash() {
     return DeterministicIds.statePolicyHash(
-        config.getString(JevConnectorConfig.STATE_MODE),
+        config.stateMode().name(),
         config.stateTemplateForHash(),
-        config.getString(JevConnectorConfig.RAW_BYTES_ENCODING));
+        config.rawBytesEncoding().configValue());
   }
 
   private static ObjectNode source(

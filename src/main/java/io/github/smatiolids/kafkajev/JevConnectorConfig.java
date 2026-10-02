@@ -184,6 +184,12 @@ final class JevConnectorConfig extends AbstractConfig {
 
   private final CompiledStateTemplate stateTemplate;
   private final ModelReference modelReference;
+  private final StateMode stateMode;
+  private final RawBytesEncoding rawBytesEncoding;
+  private final TombstoneBehavior tombstoneBehavior;
+  private final TransientExhaustedBehavior transientExhaustedBehavior;
+  private final OutputKeyMode outputKeyMode;
+  private final OutputHeadersMode outputHeadersMode;
 
   JevConnectorConfig(Map<String, ?> properties) {
     super(CONFIG_DEF, properties);
@@ -194,8 +200,15 @@ final class JevConnectorConfig extends AbstractConfig {
     validateStatePolicy();
     validateKafkaConnection();
     modelReference = ModelReference.parse(getString(MODEL));
+    stateMode = StateMode.valueOf(getString(STATE_MODE));
+    rawBytesEncoding = RawBytesEncoding.parse(getString(RAW_BYTES_ENCODING));
+    tombstoneBehavior = TombstoneBehavior.valueOf(getString(TOMBSTONE_BEHAVIOR));
+    transientExhaustedBehavior =
+        TransientExhaustedBehavior.valueOf(getString(TRANSIENT_EXHAUSTED));
+    outputKeyMode = OutputKeyMode.valueOf(getString(OUTPUT_KEY_MODE));
+    outputHeadersMode = OutputHeadersMode.valueOf(getString(OUTPUT_HEADERS_MODE));
     stateTemplate =
-        "TEMPLATE".equals(getString(STATE_MODE))
+        stateMode == StateMode.TEMPLATE
             ? CompiledStateTemplate.compile(getString(STATE_TEMPLATE))
             : null;
   }
@@ -206,6 +219,30 @@ final class JevConnectorConfig extends AbstractConfig {
 
   ModelReference modelReference() {
     return modelReference;
+  }
+
+  StateMode stateMode() {
+    return stateMode;
+  }
+
+  RawBytesEncoding rawBytesEncoding() {
+    return rawBytesEncoding;
+  }
+
+  TombstoneBehavior tombstoneBehavior() {
+    return tombstoneBehavior;
+  }
+
+  TransientExhaustedBehavior transientExhaustedBehavior() {
+    return transientExhaustedBehavior;
+  }
+
+  OutputKeyMode outputKeyMode() {
+    return outputKeyMode;
+  }
+
+  OutputHeadersMode outputHeadersMode() {
+    return outputHeadersMode;
   }
 
   String stateTemplateForHash() {
@@ -347,5 +384,54 @@ final class JevConnectorConfig extends AbstractConfig {
 
   private static boolean hasText(String value) {
     return value != null && !value.isBlank();
+  }
+
+  enum StateMode {
+    FULL_VALUE,
+    TEMPLATE
+  }
+
+  enum RawBytesEncoding {
+    DISABLED("DISABLED"),
+    UTF8("UTF-8");
+
+    private final String configValue;
+
+    RawBytesEncoding(String configValue) {
+      this.configValue = configValue;
+    }
+
+    static RawBytesEncoding parse(String value) {
+      return switch (value) {
+        case "DISABLED" -> DISABLED;
+        case "UTF-8" -> UTF8;
+        default -> throw new IllegalArgumentException("Validated raw-byte encoding became invalid");
+      };
+    }
+
+    String configValue() {
+      return configValue;
+    }
+  }
+
+  enum TombstoneBehavior {
+    IGNORE,
+    DLQ,
+    FAIL
+  }
+
+  enum TransientExhaustedBehavior {
+    FAIL,
+    DLQ
+  }
+
+  enum OutputKeyMode {
+    ORIGINAL,
+    EVALUATION_ID
+  }
+
+  enum OutputHeadersMode {
+    NONE,
+    COPY
   }
 }

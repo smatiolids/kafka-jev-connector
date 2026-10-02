@@ -51,10 +51,14 @@ final class CompiledStateTemplate {
     return new CompiledStateTemplate(segments);
   }
 
-  String render(SinkRecord record, JsonNode key, JsonNode value, boolean rawBytesUtf8) {
+  String render(
+      SinkRecord record,
+      JsonNode key,
+      JsonNode value,
+      JevConnectorConfig.RawBytesEncoding rawBytesEncoding) {
     StringBuilder state = new StringBuilder();
     for (Segment segment : segments) {
-      segment.append(state, record, key, value, rawBytesUtf8);
+      segment.append(state, record, key, value, rawBytesEncoding);
     }
     return state.toString();
   }
@@ -192,7 +196,7 @@ final class CompiledStateTemplate {
         SinkRecord record,
         JsonNode key,
         JsonNode value,
-        boolean rawBytesUtf8);
+        JevConnectorConfig.RawBytesEncoding rawBytesEncoding);
   }
 
   private record Literal(String text) implements Segment {
@@ -202,7 +206,7 @@ final class CompiledStateTemplate {
         SinkRecord record,
         JsonNode key,
         JsonNode value,
-        boolean rawBytesUtf8) {
+        JevConnectorConfig.RawBytesEncoding rawBytesEncoding) {
       target.append(text);
     }
   }
@@ -216,15 +220,15 @@ final class CompiledStateTemplate {
         SinkRecord record,
         JsonNode key,
         JsonNode value,
-        boolean rawBytesUtf8) {
+        JevConnectorConfig.RawBytesEncoding rawBytesEncoding) {
       JsonNode resolved;
       try {
         if (pointer == null && source.equals("value") && isRawBytes(record.value())) {
-          target.append(rawState(record.value(), rawBytesUtf8));
+          target.append(rawState(record.value(), rawBytesEncoding));
           return;
         }
         if (pointer == null && source.equals("key") && isRawBytes(record.key())) {
-          target.append(rawState(record.key(), rawBytesUtf8));
+          target.append(rawState(record.key(), rawBytesEncoding));
           return;
         }
         resolved = resolve(record, key, value);
@@ -295,8 +299,9 @@ final class CompiledStateTemplate {
       return value instanceof byte[] || value instanceof ByteBuffer;
     }
 
-    private static String rawState(Object value, boolean rawBytesUtf8) {
-      if (!rawBytesUtf8) {
+    private static String rawState(
+        Object value, JevConnectorConfig.RawBytesEncoding rawBytesEncoding) {
+      if (rawBytesEncoding != JevConnectorConfig.RawBytesEncoding.UTF8) {
         throw new PermanentRecordException(
             "STATE_BUILDING",
             "RAW_BYTES_DISABLED",
