@@ -20,6 +20,7 @@ final class JevConnectorConfig extends AbstractConfig {
   static final String API_KEY = "jev.api.key";
   static final String QUESTIONS = "jev.questions";
   static final String STATE_MODE = "state.mode";
+  static final String STATE_TEMPLATE = "state.template";
   static final String RAW_BYTES_ENCODING = "state.raw_bytes.encoding";
   static final String ENDPOINT = "jev.endpoint";
   static final String ALLOW_HTTP = "jev.allow.insecure.http";
@@ -41,9 +42,15 @@ final class JevConnectorConfig extends AbstractConfig {
               STATE_MODE,
               ConfigDef.Type.STRING,
               ConfigDef.NO_DEFAULT_VALUE,
-              ConfigDef.ValidString.in("FULL_VALUE"),
+              ConfigDef.ValidString.in("FULL_VALUE", "TEMPLATE"),
               ConfigDef.Importance.HIGH,
               "Evaluation State policy")
+          .define(
+              STATE_TEMPLATE,
+              ConfigDef.Type.STRING,
+              null,
+              ConfigDef.Importance.HIGH,
+              "Compiled Evaluation State template")
           .define(
               RAW_BYTES_ENCODING,
               ConfigDef.Type.STRING,
@@ -65,11 +72,25 @@ final class JevConnectorConfig extends AbstractConfig {
               ConfigDef.Importance.HIGH,
               "Output Kafka bootstrap servers");
 
+  private final CompiledStateTemplate stateTemplate;
+
   JevConnectorConfig(Map<String, ?> properties) {
     super(CONFIG_DEF, properties);
     validateTopics();
     validateQuestions();
     validateEndpoint();
+    stateTemplate =
+        "TEMPLATE".equals(getString(STATE_MODE))
+            ? CompiledStateTemplate.compile(getString(STATE_TEMPLATE))
+            : null;
+  }
+
+  CompiledStateTemplate stateTemplate() {
+    return stateTemplate;
+  }
+
+  String stateTemplateForHash() {
+    return stateTemplate == null ? null : getString(STATE_TEMPLATE);
   }
 
   JsonNode questions() {

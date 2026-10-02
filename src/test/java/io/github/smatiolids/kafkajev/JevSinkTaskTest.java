@@ -21,11 +21,13 @@ import java.util.concurrent.atomic.AtomicReference;
 import org.apache.kafka.clients.producer.MockProducer;
 import org.apache.kafka.common.record.TimestampType;
 import org.apache.kafka.common.serialization.StringSerializer;
+import org.apache.kafka.common.config.ConfigException;
 import org.apache.kafka.connect.data.Decimal;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.errors.ConnectException;
+import org.apache.kafka.connect.header.ConnectHeaders;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -222,6 +224,149 @@ class JevSinkTaskTest {
     assertFullValueState(task, receivedRequest, Schema.STRING_SCHEMA, "unquoted text", "unquoted text");
 
     task.stop();
+  }
+
+  @Test
+  void sendsTheExactAllowListedTemplateStateToJev() throws Exception {
+    AtomicReference<JsonNode> receivedRequest = new AtomicReference<>();
+    fakeJev = fakeJev(receivedRequest);
+    MockProducer<String, String> output = output();
+    JevSinkTask task = new JevSinkTask(ignored -> output);
+    Map<String, String> templateConfig = new java.util.HashMap<>(config());
+    templateConfig.put("state.mode", "TEMPLATE");
+    templateConfig.put(
+        "state.template",
+        "customer=${value:/customer/name}; key=${key:/tenant~1id}; tilde=${value:/til~0de}; "
+            + "whole-key=${key}; whole-value=${value}; items=${value:/items}; "
+            + "empty=[${value:/empty:-fallback}]; false=${value:/active:-fallback}; "
+            + "zero=${value:/count:-fallback}; null=${value:/nullable:-fallback}; "
+            + "missing=${value:/missing:-fallback}; trace=${header:trace-id}; "
+            + "absent=${header:not-there:-none}; source=${metadata:topic}/${metadata:partition}/"
+            + "${metadata:offset}@${metadata:timestamp}; escaped=\\${literal}; slash=\\\\; "
+            + "brace=${value:/missing:-right\\}}");
+    task.start(templateConfig);
+
+    ConnectHeaders headers = new ConnectHeaders();
+    headers.addBytes("trace-id", "old".getBytes(StandardCharsets.UTF_8));
+    headers.addBytes("trace-id", "latest".getBytes(StandardCharsets.UTF_8));
+    Map<String, Object> value = new LinkedHashMap<>();
+    value.put("customer", Map.of("name", "Ada"));
+    value.put("items", List.of("first", Map.of("b", 2, "a", 1)));
+    value.put("til~de", "escaped-pointer");
+    value.put("empty", "");
+    value.put("active", false);
+    value.put("count", 0);
+    value.put("nullable", null);
+    long timestamp = Instant.parse("2026-10-02T13:45:12.345Z").toEpochMilli();
+    SinkRecord source =
+        new SinkRecord(
+            "support-input",
+            2,
+            null,
+            Map.of("tenant/id", "acme"),
+            null,
+            value,
+            184,
+            timestamp,
+            TimestampType.CREATE_TIME,
+            headers);
+
+    task.put(List.of(source));
+
+    assertEquals(
+        "customer=Ada; key=acme; tilde=escaped-pointer; whole-key={\"tenant/id\":\"acme\"}; "
+            + "whole-value={\"active\":false,\"count\":0,\"customer\":{\"name\":\"Ada\"},"
+            + "\"empty\":\"\",\"items\":[\"first\",{\"a\":1,\"b\":2}],\"nullable\":null,"
+            + "\"til~de\":\"escaped-pointer\"}; items=[\"first\",{\"a\":1,\"b\":2}]; "
+            + "empty=[]; false=false; zero=0; null=fallback; missing=fallback; trace=latest; "
+            + "absent=none; source=support-input/2/184@" + timestamp
+            + "; escaped=${literal}; slash=\\; brace=right}",
+        receivedRequest.get().path("state").asText());
+    JsonNode enriched = JSON.readTree(output.history().get(0).value());
+    assertEquals("TEMPLATE", enriched.at("/evaluation/state_policy/mode").asText());
+    assertEquals(
+        DeterministicIds.statePolicyHash(
+            "TEMPLATE", templateConfig.get("state.template"), "DISABLED"),
+        enriched.at("/evaluation/state_policy/hash").asText());
+    task.stop();
+  }
+
+  @Test
+  void usesAHeaderDefaultForInvalidUtf8AndFailsWithoutOne() throws Exception {
+    AtomicReference<JsonNode> receivedRequest = new AtomicReference<>();
+    fakeJev = fakeJev(receivedRequest);
+    ConnectHeaders headers = new ConnectHeaders();
+    headers.addBytes("trace-id", new byte[] {(byte) 0xc3, 0x28});
+    SinkRecord source =
+        new SinkRecord(
+            "support-input", 2, null, null, null, Map.of("message", "safe"), 184,
+            Instant.parse("2026-10-02T13:45:12.345Z").toEpochMilli(),
+            TimestampType.CREATE_TIME, headers);
+
+    Map<String, String> withDefault = new java.util.HashMap<>(config());
+    withDefault.put("state.mode", "TEMPLATE");
+    withDefault.put("state.template", "trace=${header:trace-id:-unavailable}");
+    JevSinkTask defaultingTask = new JevSinkTask(ignored -> output());
+    defaultingTask.start(withDefault);
+    defaultingTask.put(List.of(source));
+    assertEquals("trace=unavailable", receivedRequest.get().path("state").asText());
+    defaultingTask.stop();
+
+    Map<String, String> required = new java.util.HashMap<>(withDefault);
+    required.put("state.template", "trace=${header:trace-id}");
+    JevSinkTask failingTask = new JevSinkTask(ignored -> output());
+    failingTask.start(required);
+    ConnectException error = assertThrows(ConnectException.class, () -> failingTask.put(List.of(source)));
+    assertEquals("Template header is not valid UTF-8", error.getMessage());
+    failingTask.stop();
+  }
+
+  @Test
+  void missingRequiredTemplateValuesFailBeforeJevIsCalled() throws Exception {
+    AtomicReference<JsonNode> receivedRequest = new AtomicReference<>();
+    fakeJev = fakeJev(receivedRequest);
+    Map<String, String> required = new java.util.HashMap<>(config());
+    required.put("state.mode", "TEMPLATE");
+    required.put("state.template", "approved=${value:/approved}");
+    JevSinkTask task = new JevSinkTask(ignored -> output());
+    task.start(required);
+
+    ConnectException error =
+        assertThrows(
+            ConnectException.class,
+            () -> task.put(List.of(sourceRecord(null, null, null, Map.of("secret", "hidden")))));
+
+    assertEquals("Required template reference is missing", error.getMessage());
+    assertEquals(null, receivedRequest.get());
+    task.stop();
+  }
+
+  @Test
+  void rejectsMalformedOrUnsupportedTemplatesAtStartup() throws Exception {
+    fakeJev = fakeJev(new AtomicReference<>());
+    List<String> invalidTemplates =
+        List.of(
+            "${unknown:anything}",
+            "${metadata:unknown}",
+            "${value:not-a-pointer}",
+            "${value:/bad~2escape}",
+            "${value:/unterminated",
+            "bad\\q",
+            "bad\\}");
+
+    for (String template : invalidTemplates) {
+      Map<String, String> invalid = new java.util.HashMap<>(config());
+      invalid.put("state.mode", "TEMPLATE");
+      invalid.put("state.template", template);
+      assertThrows(
+          ConfigException.class,
+          () -> new JevSinkTask(ignored -> output()).start(invalid),
+          template);
+    }
+
+    Map<String, String> missing = new java.util.HashMap<>(config());
+    missing.put("state.mode", "TEMPLATE");
+    assertThrows(ConfigException.class, () -> new JevSinkTask(ignored -> output()).start(missing));
   }
 
   private void assertFullValueState(

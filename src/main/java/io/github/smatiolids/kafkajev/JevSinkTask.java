@@ -77,7 +77,7 @@ public final class JevSinkTask extends SinkTask {
     JsonNode canonicalValue =
         canonicalizer.canonicalize(sourceRecord.valueSchema(), sourceRecord.value());
     JsonNode canonicalKey = canonicalizer.canonicalize(sourceRecord.keySchema(), sourceRecord.key());
-    String state = fullValueState(sourceRecord, canonicalValue);
+    String state = evaluationState(sourceRecord, canonicalKey, canonicalValue);
 
     long startedAt = System.nanoTime();
     InferenceResult inferenceResult = callJev(state);
@@ -147,7 +147,7 @@ public final class JevSinkTask extends SinkTask {
     String statePolicyHash =
         DeterministicIds.statePolicyHash(
             config.getString(JevConnectorConfig.STATE_MODE),
-            null,
+            config.stateTemplateForHash(),
             config.getString(JevConnectorConfig.RAW_BYTES_ENCODING));
     String resolvedModel = inferenceResult.resolvedModel();
     String evaluationId =
@@ -211,6 +211,14 @@ public final class JevSinkTask extends SinkTask {
       return decodeUtf8(sourceRecord.value());
     }
     return render(canonicalValue);
+  }
+
+  private String evaluationState(
+      SinkRecord sourceRecord, JsonNode canonicalKey, JsonNode canonicalValue) {
+    if (config.stateTemplate() != null) {
+      return config.stateTemplate().render(sourceRecord, canonicalKey, canonicalValue);
+    }
+    return fullValueState(sourceRecord, canonicalValue);
   }
 
   private static boolean isRawBytes(Schema schema, Object value) {
