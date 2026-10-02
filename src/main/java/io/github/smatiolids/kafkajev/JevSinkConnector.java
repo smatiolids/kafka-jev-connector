@@ -56,7 +56,7 @@ public final class JevSinkConnector extends SinkConnector {
     return Version.VALUE;
   }
 
-  private static void validatePrecreatedTopics(
+  static void validatePrecreatedTopics(
       Set<String> topics, Map<String, Object> clientProperties) {
     try (Admin admin = Admin.create(clientProperties)) {
       admin.describeTopics(topics).allTopicNames().get();

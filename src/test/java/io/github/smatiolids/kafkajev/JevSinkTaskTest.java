@@ -21,6 +21,7 @@ import java.util.Date;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -793,9 +794,47 @@ class JevSinkTaskTest {
     assertEquals(StringSerializer.class.getName(), actual.get(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG));
     assertEquals(
         StringSerializer.class.getName(), actual.get(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG));
-    assertEquals(false, actual.get("allow.auto.create.topics"));
+    assertFalse(actual.containsKey("allow.auto.create.topics"));
     assertFalse(actual.keySet().stream().anyMatch(name -> name.startsWith("producer.override.")));
     task.stop();
+  }
+
+  @Test
+  void taskVerifiesPrecreatedPublicationTopicsBeforeConstructingItsProducer() {
+    AtomicReference<Set<String>> checkedTopics = new AtomicReference<>();
+    AtomicReference<Map<String, Object>> checkedProperties = new AtomicReference<>();
+    AtomicInteger producerCreations = new AtomicInteger();
+    JevSinkTask task =
+        new JevSinkTask(
+            properties -> {
+              producerCreations.incrementAndGet();
+              return output();
+            },
+            (topics, properties) -> {
+              checkedTopics.set(Set.copyOf(topics));
+              checkedProperties.set(Map.copyOf(properties));
+            });
+
+    task.start(config("http://127.0.0.1:1/evaluate"));
+
+    assertEquals(Set.of("support-output", "support-dlq"), checkedTopics.get());
+    assertFalse(checkedProperties.get().containsKey("allow.auto.create.topics"));
+    assertEquals(1, producerCreations.get());
+    task.stop();
+
+    JevSinkTask missingTopics =
+        new JevSinkTask(
+            properties -> {
+              producerCreations.incrementAndGet();
+              return output();
+            },
+            (topics, properties) -> {
+              throw new ConnectException("Publication topics must be pre-created");
+            });
+    assertThrows(
+        ConnectException.class,
+        () -> missingTopics.start(config("http://127.0.0.1:1/evaluate")));
+    assertEquals(1, producerCreations.get());
   }
 
   @Test

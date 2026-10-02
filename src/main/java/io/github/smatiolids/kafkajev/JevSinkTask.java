@@ -20,6 +20,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -49,6 +50,7 @@ public final class JevSinkTask extends SinkTask {
   private static final String RESOLVED_MODEL_HEADER = "kafka-jev-resolved-model";
 
   private final Function<Map<String, Object>, Producer<String, String>> producerFactory;
+  private final JevSinkConnector.TopicExistenceValidator topicExistenceValidator;
   private final Sleeper sleeper;
   private final DoubleSupplier jitterMultiplier;
   private final LongSupplier monotonicNanos;
@@ -60,12 +62,24 @@ public final class JevSinkTask extends SinkTask {
   private volatile boolean batchFailed;
 
   public JevSinkTask() {
-    this(properties -> new KafkaProducer<>(properties));
+    this(properties -> new KafkaProducer<>(properties), JevSinkConnector::validatePrecreatedTopics);
   }
 
   JevSinkTask(Function<Map<String, Object>, Producer<String, String>> producerFactory) {
     this(
         producerFactory,
+        (topics, properties) -> {},
+        Thread::sleep,
+        () -> 0.5 + ThreadLocalRandom.current().nextDouble(),
+        System::nanoTime);
+  }
+
+  JevSinkTask(
+      Function<Map<String, Object>, Producer<String, String>> producerFactory,
+      JevSinkConnector.TopicExistenceValidator topicExistenceValidator) {
+    this(
+        producerFactory,
+        topicExistenceValidator,
         Thread::sleep,
         () -> 0.5 + ThreadLocalRandom.current().nextDouble(),
         System::nanoTime);
@@ -76,7 +90,17 @@ public final class JevSinkTask extends SinkTask {
       Sleeper sleeper,
       DoubleSupplier jitterMultiplier,
       LongSupplier monotonicNanos) {
+    this(producerFactory, (topics, properties) -> {}, sleeper, jitterMultiplier, monotonicNanos);
+  }
+
+  private JevSinkTask(
+      Function<Map<String, Object>, Producer<String, String>> producerFactory,
+      JevSinkConnector.TopicExistenceValidator topicExistenceValidator,
+      Sleeper sleeper,
+      DoubleSupplier jitterMultiplier,
+      LongSupplier monotonicNanos) {
     this.producerFactory = producerFactory;
+    this.topicExistenceValidator = topicExistenceValidator;
     this.sleeper = sleeper;
     this.jitterMultiplier = jitterMultiplier;
     this.monotonicNanos = monotonicNanos;
@@ -85,7 +109,10 @@ public final class JevSinkTask extends SinkTask {
   @Override
   public void start(Map<String, String> properties) {
     config = new JevConnectorConfig(properties);
-    producer = producerFactory.apply(producerProperties(config));
+    Map<String, Object> producerProperties = producerProperties(config);
+    topicExistenceValidator.validate(
+        Set.of(config.outputTopic(), config.deadLetterTopic()), producerProperties);
+    producer = producerFactory.apply(producerProperties);
     batchWorkers =
         Executors.newFixedThreadPool(config.getInt(JevConnectorConfig.MAX_IN_FLIGHT));
     http =
@@ -661,7 +688,6 @@ public final class JevSinkTask extends SinkTask {
     properties.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
     properties.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
     properties.put(ProducerConfig.ACKS_CONFIG, "all");
-    properties.put("allow.auto.create.topics", false);
     @SuppressWarnings({"unchecked", "rawtypes"})
     Map<String, Object> result = (Map) properties;
     return result;
