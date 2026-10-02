@@ -3,7 +3,7 @@ package io.github.smatiolids.kafkajev;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.net.URI;
-import java.util.Arrays;
+import java.util.LinkedHashSet;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
@@ -27,6 +27,7 @@ final class JevConnectorConfig extends AbstractConfig {
   static final String ENDPOINT = "jev.endpoint";
   static final String ALLOW_HTTP = "jev.allow.insecure.http";
   static final String MODEL = "jev.model";
+  static final String MAX_IN_FLIGHT = "jev.max.in.flight";
   static final String CONNECT_TIMEOUT_MS = "jev.connect.timeout.ms";
   static final String REQUEST_TIMEOUT_MS = "jev.request.timeout.ms";
   static final String RETRY_MAX_ATTEMPTS = "jev.retry.max.attempts";
@@ -34,6 +35,11 @@ final class JevConnectorConfig extends AbstractConfig {
   static final String RETRY_MAX_RETRY_AFTER_MS = "jev.retry.max.retry_after.ms";
   static final String TRANSIENT_EXHAUSTED = "errors.transient.exhausted";
   static final String OUTPUT_BOOTSTRAP = "output.bootstrap.servers";
+  static final String OUTPUT_KEY_MODE = "output.key.mode";
+  static final String OUTPUT_HEADERS_MODE = "output.headers.mode";
+  static final String KAFKA_ENDPOINT = "kafka.endpoint";
+  static final String KAFKA_API_KEY = "kafka.api.key";
+  static final String KAFKA_API_SECRET = "kafka.api.secret";
 
   private static final ObjectMapper JSON = new ObjectMapper();
 
@@ -89,6 +95,13 @@ final class JevConnectorConfig extends AbstractConfig {
           .define(ALLOW_HTTP, ConfigDef.Type.BOOLEAN, false, ConfigDef.Importance.LOW, "Allow local HTTP")
           .define(MODEL, ConfigDef.Type.STRING, "jev-latest", ConfigDef.Importance.MEDIUM, "Requested model")
           .define(
+              MAX_IN_FLIGHT,
+              ConfigDef.Type.INT,
+              4,
+              ConfigDef.Range.atLeast(1),
+              ConfigDef.Importance.MEDIUM,
+              "Maximum concurrent Jev requests per task")
+          .define(
               CONNECT_TIMEOUT_MS,
               ConfigDef.Type.INT,
               5000,
@@ -131,18 +144,54 @@ final class JevConnectorConfig extends AbstractConfig {
               ConfigDef.Importance.MEDIUM,
               "Outcome after transient Jev attempts are exhausted")
           .define(
+              OUTPUT_KEY_MODE,
+              ConfigDef.Type.STRING,
+              "ORIGINAL",
+              ConfigDef.ValidString.in("ORIGINAL", "EVALUATION_ID"),
+              ConfigDef.Importance.MEDIUM,
+              "Enriched Record key mode")
+          .define(
+              OUTPUT_HEADERS_MODE,
+              ConfigDef.Type.STRING,
+              "NONE",
+              ConfigDef.ValidString.in("NONE", "COPY"),
+              ConfigDef.Importance.MEDIUM,
+              "Source Record header propagation mode")
+          .define(
               OUTPUT_BOOTSTRAP,
               ConfigDef.Type.STRING,
+              null,
               ConfigDef.Importance.HIGH,
-              "Output Kafka bootstrap servers");
+              "Output Kafka bootstrap servers")
+          .define(
+              KAFKA_ENDPOINT,
+              ConfigDef.Type.STRING,
+              null,
+              ConfigDef.Importance.HIGH,
+              "Confluent Cloud Kafka endpoint")
+          .define(
+              KAFKA_API_KEY,
+              ConfigDef.Type.PASSWORD,
+              null,
+              ConfigDef.Importance.HIGH,
+              "Kafka API key")
+          .define(
+              KAFKA_API_SECRET,
+              ConfigDef.Type.PASSWORD,
+              null,
+              ConfigDef.Importance.HIGH,
+              "Kafka API secret");
 
   private final CompiledStateTemplate stateTemplate;
 
   JevConnectorConfig(Map<String, ?> properties) {
     super(CONFIG_DEF, properties);
+    validateRequiredValues();
     validateTopics();
     validateQuestions();
     validateEndpoint();
+    validateStatePolicy();
+    validateKafkaConnection();
     stateTemplate =
         "TEMPLATE".equals(getString(STATE_MODE))
             ? CompiledStateTemplate.compile(getString(STATE_TEMPLATE))
@@ -165,15 +214,72 @@ final class JevConnectorConfig extends AbstractConfig {
     }
   }
 
+  Set<String> inputTopics() {
+    LinkedHashSet<String> topics = new LinkedHashSet<>();
+    for (String topic : getString(TOPICS).split(",", -1)) {
+      topics.add(topic.trim());
+    }
+    return Set.copyOf(topics);
+  }
+
+  Set<String> allTopics() {
+    LinkedHashSet<String> topics = new LinkedHashSet<>(inputTopics());
+    topics.add(getString(OUTPUT_TOPIC).trim());
+    topics.add(getString(DLQ_TOPIC).trim());
+    return Set.copyOf(topics);
+  }
+
+  String outputTopic() {
+    return getString(OUTPUT_TOPIC).trim();
+  }
+
+  String deadLetterTopic() {
+    return getString(DLQ_TOPIC).trim();
+  }
+
+  boolean usesCloudKafkaEndpoint() {
+    return hasText(getString(KAFKA_ENDPOINT));
+  }
+
+  boolean hasKafkaCredentials() {
+    return getPassword(KAFKA_API_KEY) != null && getPassword(KAFKA_API_SECRET) != null;
+  }
+
+  private void validateRequiredValues() {
+    for (String key :
+        Set.of(
+            NAME,
+            TOPICS,
+            OUTPUT_TOPIC,
+            DLQ_TOPIC,
+            QUESTION_SET_ID,
+            QUESTIONS,
+            STATE_MODE,
+            MODEL)) {
+      if (!hasText(getString(key))) {
+        throw new ConfigException(key, null, "must be non-empty");
+      }
+    }
+    if (getPassword(API_KEY) == null || !hasText(getPassword(API_KEY).value())) {
+      throw new ConfigException(API_KEY, null, "must be non-empty");
+    }
+  }
+
   private void validateTopics() {
+    if (originals().containsKey("topics.regex")) {
+      throw new ConfigException("topics.regex is not supported; configure explicit topics");
+    }
+    String[] configuredInputs = getString(TOPICS).split(",", -1);
     Set<String> inputTopics = new HashSet<>();
-    Arrays.stream(getString(TOPICS).split(","))
-        .map(String::trim)
-        .filter(topic -> !topic.isEmpty())
-        .forEach(inputTopics::add);
-    String output = getString(OUTPUT_TOPIC);
-    String dlq = getString(DLQ_TOPIC);
-    if (inputTopics.isEmpty() || inputTopics.contains(output) || inputTopics.contains(dlq) || output.equals(dlq)) {
+    for (String configured : configuredInputs) {
+      String topic = configured.trim();
+      if (topic.isEmpty() || !inputTopics.add(topic)) {
+        throw new ConfigException(TOPICS, null, "must contain unique, non-empty explicit topics");
+      }
+    }
+    String output = getString(OUTPUT_TOPIC).trim();
+    String dlq = getString(DLQ_TOPIC).trim();
+    if (inputTopics.contains(output) || inputTopics.contains(dlq) || output.equals(dlq)) {
       throw new ConfigException("Input, output, and dead-letter topics must be distinct");
     }
   }
@@ -194,8 +300,42 @@ final class JevConnectorConfig extends AbstractConfig {
     }
     boolean http = "http".equalsIgnoreCase(endpoint.getScheme());
     boolean https = "https".equalsIgnoreCase(endpoint.getScheme());
-    if (!endpoint.isAbsolute() || (!http && !https) || (http && !getBoolean(ALLOW_HTTP))) {
+    if (!endpoint.isAbsolute()
+        || endpoint.getHost() == null
+        || endpoint.getUserInfo() != null
+        || (!http && !https)
+        || (http && !getBoolean(ALLOW_HTTP))) {
       throw new ConfigException(ENDPOINT, endpoint, "must use HTTPS unless insecure HTTP is explicitly enabled");
     }
+  }
+
+  private void validateStatePolicy() {
+    boolean configuredTemplate = originals().containsKey(STATE_TEMPLATE);
+    if ("TEMPLATE".equals(getString(STATE_MODE))) {
+      if (!configuredTemplate || !hasText(getString(STATE_TEMPLATE))) {
+        throw new ConfigException(STATE_TEMPLATE, null, "is required for TEMPLATE state mode");
+      }
+    } else if (configuredTemplate) {
+      throw new ConfigException(STATE_TEMPLATE, null, "is only valid for TEMPLATE state mode");
+    }
+  }
+
+  private void validateKafkaConnection() {
+    boolean local = hasText(getString(OUTPUT_BOOTSTRAP));
+    boolean cloud = hasText(getString(KAFKA_ENDPOINT));
+    boolean key = getPassword(KAFKA_API_KEY) != null && hasText(getPassword(KAFKA_API_KEY).value());
+    boolean secret =
+        getPassword(KAFKA_API_SECRET) != null && hasText(getPassword(KAFKA_API_SECRET).value());
+    if (local == cloud) {
+      throw new ConfigException(
+          "Configure exactly one of output.bootstrap.servers or kafka.endpoint");
+    }
+    if (key != secret || (cloud && !key)) {
+      throw new ConfigException("Kafka API key and secret must be configured together");
+    }
+  }
+
+  private static boolean hasText(String value) {
+    return value != null && !value.isBlank();
   }
 }

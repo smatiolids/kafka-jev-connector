@@ -29,6 +29,8 @@ import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.Producer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.config.SaslConfigs;
+import org.apache.kafka.clients.CommonClientConfigs;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.serialization.StringSerializer;
@@ -190,7 +192,7 @@ public final class JevSinkTask extends SinkTask {
     String key = sourceRecord.key() == null ? null : render(canonicalKey);
     ProducerRecord<String, String> output =
         new ProducerRecord<>(
-            config.getString(JevConnectorConfig.OUTPUT_TOPIC),
+            config.outputTopic(),
             null,
             sourceRecord.timestamp(),
             key,
@@ -248,7 +250,7 @@ public final class JevSinkTask extends SinkTask {
 
     publish(
         new ProducerRecord<>(
-            config.getString(JevConnectorConfig.DLQ_TOPIC),
+            config.deadLetterTopic(),
             null,
             sourceRecord.timestamp(),
             sourceId,
@@ -557,11 +559,26 @@ public final class JevSinkTask extends SinkTask {
         "version", Version.VALUE);
   }
 
-  private static Map<String, Object> producerProperties(JevConnectorConfig config) {
+  static Map<String, Object> producerProperties(JevConnectorConfig config) {
     Properties properties = new Properties();
     properties.put(
         ProducerConfig.BOOTSTRAP_SERVERS_CONFIG,
-        config.getString(JevConnectorConfig.OUTPUT_BOOTSTRAP));
+        config.usesCloudKafkaEndpoint()
+            ? config.getString(JevConnectorConfig.KAFKA_ENDPOINT).trim()
+            : config.getString(JevConnectorConfig.OUTPUT_BOOTSTRAP).trim());
+    if (config.hasKafkaCredentials()) {
+      properties.put(CommonClientConfigs.SECURITY_PROTOCOL_CONFIG, "SASL_SSL");
+      properties.put(SaslConfigs.SASL_MECHANISM, "PLAIN");
+      properties.put(
+          SaslConfigs.SASL_JAAS_CONFIG,
+          "org.apache.kafka.common.security.plain.PlainLoginModule required username=\""
+              + escapeJaas(config.getPassword(JevConnectorConfig.KAFKA_API_KEY).value())
+              + "\" password=\""
+              + escapeJaas(config.getPassword(JevConnectorConfig.KAFKA_API_SECRET).value())
+              + "\";");
+    } else {
+      properties.put(CommonClientConfigs.SECURITY_PROTOCOL_CONFIG, "PLAINTEXT");
+    }
     properties.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
     properties.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
     properties.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
@@ -570,6 +587,10 @@ public final class JevSinkTask extends SinkTask {
     @SuppressWarnings({"unchecked", "rawtypes"})
     Map<String, Object> result = (Map) properties;
     return result;
+  }
+
+  private static String escapeJaas(String value) {
+    return value.replace("\\", "\\\\").replace("\"", "\\\"");
   }
 
   @FunctionalInterface
