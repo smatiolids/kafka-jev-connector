@@ -37,72 +37,29 @@ The ZIP is the deployment artifact for both Confluent Cloud and the supplied loc
 
 The repository's Docker Compose environment runs Kafka Connect 4.2, Kafka, and a deterministic fake Jev endpoint. It does not require a real TypeSafe API key.
 
-Start the environment:
+Run the complete repeatable verification:
 
 ```bash
-docker compose up --build -d
+./scripts/smoke-test.sh
 ```
 
-Create the pre-required topics:
+The script builds the plugin ZIP, installs that ZIP in the Connect image, starts the three services, creates all pre-required topics, registers `config/local-connector.json`, and verifies:
 
-```bash
-docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
-  --bootstrap-server kafka:9092 \
-  --create --if-not-exists --topic jev-input
+- a successful Source Record becomes a contract-compliant Enriched Record;
+- fake Jev's controlled `413` becomes a sanitized Dead-Letter Record without its raw response body;
+- repeated controlled `503` responses exhaust retry and fail the task while the Source Record offset remains uncommitted;
+- Connect and fake-Jev logs omit the API key, Source Record marker, generated Evaluation State, and fake remote-body markers.
 
-docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
-  --bootstrap-server kafka:9092 \
-  --create --if-not-exists --topic jev-output
+Success prints these stable checkpoints:
 
-docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
-  --bootstrap-server kafka:9092 \
-  --create --if-not-exists --topic jev-dlq
+```text
+ENRICHED_RECORD_OK
+SANITIZED_DEAD_LETTER_OK
+TRANSIENT_UNCOMMITTED_OK
+LOG_BOUNDARY_OK
 ```
 
-Create the connector from the supplied example:
-
-```bash
-curl --fail --silent --show-error \
-  -X POST http://localhost:8083/connectors \
-  -H 'Content-Type: application/json' \
-  --data @config/local-connector.json
-```
-
-Produce a test record:
-
-```bash
-docker compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh \
-  --bootstrap-server kafka:9092 \
-  --topic jev-input \
-  --property parse.key=true \
-  --property key.separator='|' <<'EOF'
-customer-42|{"message":"Please help, this is urgent"}
-EOF
-```
-
-Consume the Enriched Record:
-
-```bash
-docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
-  --bootstrap-server kafka:9092 \
-  --topic jev-output \
-  --from-beginning \
-  --max-messages 1 \
-  --property print.key=true
-```
-
-Check connector status and logs:
-
-```bash
-curl --fail --silent --show-error http://localhost:8083/connectors/jev-local/status
-docker compose logs --no-color connect fake-jev
-```
-
-Stop the environment when finished:
-
-```bash
-docker compose down
-```
+The environment is removed automatically. Set `KEEP_SMOKE_ENV=1` to retain it for inspection, then use `docker compose logs --no-color connect fake-jev` and `docker compose down --volumes` when finished. The fake endpoint is local test infrastructure only; never configure `jev.allow.insecure.http=true` in production.
 
 ## Optional Local Test with TypeSafe AI
 
@@ -227,11 +184,11 @@ For Avro, JSON Schema, or Protobuf input, select the corresponding standard conv
 
 ## Operating Notes
 
-- Delivery is at least once. Consumers requiring unique effects must deduplicate by Evaluation ID or configure `output.key.mode=EVALUATION_ID` and use a compacted output topic.
+- Delivery is at least once, not exactly once: a crash after Jev evaluation or output publication but before the managed input offset commits can repeat the HTTP evaluation and Enriched Record. Consumers requiring unique effects must deduplicate by Evaluation ID. Alternatively, configure `output.key.mode=EVALUATION_ID` and use a compacted output topic when retaining the latest record per evaluation is appropriate; compaction is asynchronous and does not prevent consumers from observing duplicates before compaction.
 - Changing Question Set content requires a new immutable `question.set.id`.
 - A moving model alias can resolve to a new model and therefore produce a new Evaluation ID; pin a model version for reproducibility.
 - Scale `tasks.max`, `consumer.override.max.poll.records`, and `jev.max.in.flight` together while respecting the TypeSafe account-wide request and token limits.
-- Permanent record-specific failures go to the dead-letter topic. Authentication, configuration, protocol, Kafka-publication, and exhausted transient failures stop or retry the task without committing the affected batch by default.
+- Permanent record-specific failures go to the dead-letter topic. Authentication, configuration, protocol, Kafka-publication, and exhausted transient failures stop or retry the task without committing the affected batch by default. On recovery, Connect re-delivers from the last committed offset, so downstream processing must remain idempotent by Evaluation ID.
 - Dead-Letter Records are diagnostic evidence, not connector input. Manual republishing of the original key/value creates a new Source ID and Evaluation ID.
 
 See [Connector Configuration](docs/configuration.md), [Record Contracts](docs/record-contracts.md), and the [domain glossary](CONTEXT.md) for the full contract.
