@@ -3,29 +3,27 @@ package io.github.smatiolids.kafkajev;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.ExecutionException;
-import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.common.config.ConfigDef;
 import org.apache.kafka.connect.connector.Task;
 import org.apache.kafka.connect.sink.SinkConnector;
 
 public final class JevSinkConnector extends SinkConnector {
-  private final TopicExistenceValidator topicExistenceValidator;
+  private final KafkaPublicationFactory.TopicExistenceValidator topicExistenceValidator;
   private Map<String, String> properties;
 
   public JevSinkConnector() {
-    this(JevSinkConnector::validatePrecreatedTopics);
+    this(KafkaPublicationFactory::validatePrecreatedTopics);
   }
 
-  JevSinkConnector(TopicExistenceValidator topicExistenceValidator) {
+  JevSinkConnector(KafkaPublicationFactory.TopicExistenceValidator topicExistenceValidator) {
     this.topicExistenceValidator = topicExistenceValidator;
   }
 
   @Override
   public void start(Map<String, String> properties) {
     JevConnectorConfig config = new JevConnectorConfig(properties);
-    topicExistenceValidator.validate(config.allTopics(), JevSinkTask.producerProperties(config));
+    topicExistenceValidator.validate(
+        config.allTopics(), KafkaPublicationFactory.mandatoryProperties(config));
     this.properties = Map.copyOf(properties);
   }
 
@@ -56,22 +54,4 @@ public final class JevSinkConnector extends SinkConnector {
     return Version.VALUE;
   }
 
-  static void validatePrecreatedTopics(
-      Set<String> topics, Map<String, Object> clientProperties) {
-    try (Admin admin = Admin.create(clientProperties)) {
-      admin.describeTopics(topics).allTopicNames().get();
-    } catch (InterruptedException failure) {
-      Thread.currentThread().interrupt();
-      throw new org.apache.kafka.connect.errors.ConnectException(
-          "Interrupted while verifying pre-created topics", failure);
-    } catch (ExecutionException | RuntimeException failure) {
-      throw new org.apache.kafka.connect.errors.ConnectException(
-          "Configured input, output, and dead-letter topics must be pre-created", failure);
-    }
-  }
-
-  @FunctionalInterface
-  interface TopicExistenceValidator {
-    void validate(Set<String> topics, Map<String, Object> clientProperties);
-  }
 }

@@ -8,7 +8,6 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
-import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -18,16 +17,11 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.DoubleSupplier;
 import java.util.function.Function;
 import java.util.function.LongSupplier;
-import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.Producer;
-import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
-import org.apache.kafka.common.config.SaslConfigs;
-import org.apache.kafka.clients.CommonClientConfigs;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.header.internals.RecordHeaders;
 import org.apache.kafka.common.TopicPartition;
-import org.apache.kafka.common.serialization.StringSerializer;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.sink.SinkRecord;
@@ -38,7 +32,7 @@ public final class JevSinkTask extends SinkTask {
   private static final String RESOLVED_MODEL_HEADER = "kafka-jev-resolved-model";
 
   private final Function<Map<String, Object>, Producer<String, String>> producerFactory;
-  private final JevSinkConnector.TopicExistenceValidator topicExistenceValidator;
+  private final KafkaPublicationFactory.TopicExistenceValidator topicExistenceValidator;
   private final JevClient.Sleeper sleeper;
   private final DoubleSupplier jitterMultiplier;
   private final LongSupplier monotonicNanos;
@@ -51,7 +45,9 @@ public final class JevSinkTask extends SinkTask {
   private volatile boolean batchFailed;
 
   public JevSinkTask() {
-    this(properties -> new KafkaProducer<>(properties), JevSinkConnector::validatePrecreatedTopics);
+    this(
+        KafkaPublicationFactory::createKafkaProducer,
+        KafkaPublicationFactory::validatePrecreatedTopics);
   }
 
   JevSinkTask(Function<Map<String, Object>, Producer<String, String>> producerFactory) {
@@ -65,7 +61,7 @@ public final class JevSinkTask extends SinkTask {
 
   JevSinkTask(
       Function<Map<String, Object>, Producer<String, String>> producerFactory,
-      JevSinkConnector.TopicExistenceValidator topicExistenceValidator) {
+      KafkaPublicationFactory.TopicExistenceValidator topicExistenceValidator) {
     this(
         producerFactory,
         topicExistenceValidator,
@@ -84,7 +80,7 @@ public final class JevSinkTask extends SinkTask {
 
   private JevSinkTask(
       Function<Map<String, Object>, Producer<String, String>> producerFactory,
-      JevSinkConnector.TopicExistenceValidator topicExistenceValidator,
+      KafkaPublicationFactory.TopicExistenceValidator topicExistenceValidator,
       JevClient.Sleeper sleeper,
       DoubleSupplier jitterMultiplier,
       LongSupplier monotonicNanos) {
@@ -99,10 +95,9 @@ public final class JevSinkTask extends SinkTask {
   public void start(Map<String, String> properties) {
     config = new JevConnectorConfig(properties);
     envelopes = new EvaluationEnvelopeFactory(config);
-    Map<String, Object> producerProperties = producerProperties(config);
-    topicExistenceValidator.validate(
-        Set.of(config.outputTopic(), config.deadLetterTopic()), producerProperties);
-    producer = producerFactory.apply(producerProperties);
+    producer =
+        new KafkaPublicationFactory(config, producerFactory, topicExistenceValidator)
+            .create(Set.of(config.outputTopic(), config.deadLetterTopic()));
     batchWorkers =
         Executors.newFixedThreadPool(config.getInt(JevConnectorConfig.MAX_IN_FLIGHT));
     jevClient = new JevClient(config, sleeper, jitterMultiplier);
@@ -379,39 +374,6 @@ public final class JevSinkTask extends SinkTask {
 
   private long elapsedMillis(long startedAt) {
     return Math.max(1, (monotonicNanos.getAsLong() - startedAt + 999_999) / 1_000_000);
-  }
-
-  static Map<String, Object> producerProperties(JevConnectorConfig config) {
-    Properties properties = new Properties();
-    properties.put(
-        ProducerConfig.BOOTSTRAP_SERVERS_CONFIG,
-        config.usesCloudKafkaEndpoint()
-            ? config.getString(JevConnectorConfig.KAFKA_ENDPOINT).trim()
-            : config.getString(JevConnectorConfig.OUTPUT_BOOTSTRAP).trim());
-    if (config.hasKafkaCredentials()) {
-      properties.put(CommonClientConfigs.SECURITY_PROTOCOL_CONFIG, "SASL_SSL");
-      properties.put(SaslConfigs.SASL_MECHANISM, "PLAIN");
-      properties.put(
-          SaslConfigs.SASL_JAAS_CONFIG,
-          "org.apache.kafka.common.security.plain.PlainLoginModule required username=\""
-              + escapeJaas(config.getPassword(JevConnectorConfig.KAFKA_API_KEY).value())
-              + "\" password=\""
-              + escapeJaas(config.getPassword(JevConnectorConfig.KAFKA_API_SECRET).value())
-              + "\";");
-    } else {
-      properties.put(CommonClientConfigs.SECURITY_PROTOCOL_CONFIG, "PLAINTEXT");
-    }
-    properties.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
-    properties.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
-    properties.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
-    properties.put(ProducerConfig.ACKS_CONFIG, "all");
-    @SuppressWarnings({"unchecked", "rawtypes"})
-    Map<String, Object> result = (Map) properties;
-    return result;
-  }
-
-  private static String escapeJaas(String value) {
-    return value.replace("\\", "\\\\").replace("\"", "\\\"");
   }
 
 }
