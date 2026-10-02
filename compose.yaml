@@ -1,0 +1,49 @@
+name: kafka-jev-smoke
+
+services:
+  kafka:
+    image: apache/kafka:4.2.0
+    hostname: kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  fake-jev:
+    image: python:3.13-alpine
+    command: ["python", "/app/fake-jev.py"]
+    volumes:
+      - ./local-kafka/fake-jev.py:/app/fake-jev.py:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health').read()"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  connect:
+    build:
+      context: .
+      dockerfile: local-kafka/connect.Dockerfile
+    ports:
+      - "${CONNECT_PORT:-18083}:8083"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      fake-jev:
+        condition: service_healthy
+    command: ["/opt/kafka/bin/connect-distributed.sh", "/opt/kafka/config/connect-distributed.properties"]

@@ -12,6 +12,16 @@ Build and test both release artifacts with:
 mvn verify
 ```
 
+Run the release-level local verification (Docker Compose required) with:
+
+```bash
+./scripts/smoke-test.sh
+```
+
+It builds the plugin ZIP, starts Kafka and Kafka Connect 4.2 plus a deterministic
+fake Jev service, and verifies the Enriched Record, sanitized dead-letter,
+uncommitted transient-failure, and log-security paths.
+
 The build writes a normal connector JAR and a self-contained Confluent plugin
 ZIP to `target/`. The ZIP bundles connector runtime dependencies while excluding
 Kafka Connect, Kafka client, and logging libraries supplied by the worker.
