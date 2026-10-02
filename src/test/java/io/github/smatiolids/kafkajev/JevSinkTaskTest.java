@@ -494,6 +494,62 @@ class JevSinkTaskTest {
     equivalentTask.stop();
   }
 
+  @Test
+  void rejectsInferenceResultsWithoutAUsableResolvedModel() throws Exception {
+    AtomicReference<String> responseBody =
+        new AtomicReference<>("{\"model\":\" jev-1.13.0 \"}");
+    fakeJev = fakeJevResponse(responseBody);
+    MockProducer<String, String> output = output();
+    JevSinkTask task = new JevSinkTask(ignored -> output);
+    task.start(config());
+
+    for (String invalidResponse :
+        List.of(
+            "[]",
+            "\"not an object\"",
+            "{}",
+            "{\"model\":null}",
+            "{\"model\":13}",
+            "{\"model\":\"\"}",
+            "{\"model\":\" jev-1.13.0 \"}")) {
+      responseBody.set(invalidResponse);
+      ConnectException failure =
+          assertThrows(
+              ConnectException.class,
+              () -> task.put(List.of(sourceRecord(null, "customer-42", null, "same source"))));
+      assertEquals("Jev response must be a JSON object with a usable model", failure.getMessage());
+    }
+    assertEquals(0, output.history().size());
+    task.stop();
+  }
+
+  @Test
+  void pinnedAndAliasRequestsRetainDistinctProvenanceButShareResolvedModelIdentity()
+      throws Exception {
+    String response =
+        "{\"model\":\"jev-1.13.0\",\"answers\":{\"department\":\"technical\"},"
+            + "\"usage\":{\"input_tokens\":17},\"provider_metadata\":{\"trace\":\"opaque\"},"
+            + "\"future_field\":[false,0,\"\"]}";
+    fakeJev = fakeJevResponse(new AtomicReference<>(response));
+    SinkRecord source = sourceRecord(null, "customer-42", null, "same source");
+
+    JsonNode aliasEvaluation = evaluate(source, config());
+    Map<String, String> pinnedConfig = new java.util.HashMap<>(config());
+    pinnedConfig.put("jev.model", "jev-1.13.0");
+    JsonNode pinnedEvaluation = evaluate(source, pinnedConfig);
+
+    assertEquals("jev-latest", aliasEvaluation.at("/evaluation/model/requested").asText());
+    assertEquals("jev-1.13.0", pinnedEvaluation.at("/evaluation/model/requested").asText());
+    assertEquals("jev-1.13.0", aliasEvaluation.at("/evaluation/model/resolved").asText());
+    assertEquals("jev-1.13.0", pinnedEvaluation.at("/evaluation/model/resolved").asText());
+    assertEquals(
+        "sha256:dcc2ee43358f5b0068a0ad5d2e499b306524c96d74c167f60def5dce019e3fa9",
+        aliasEvaluation.at("/evaluation/id").asText());
+    assertEquals(aliasEvaluation.at("/evaluation/id"), pinnedEvaluation.at("/evaluation/id"));
+    assertEquals(JSON.readTree(response), aliasEvaluation.path("jev"));
+    assertEquals(JSON.readTree(response), pinnedEvaluation.path("jev"));
+  }
+
   private JsonNode evaluate(SinkRecord source, Map<String, String> connectorConfig) throws Exception {
     MockProducer<String, String> output = output();
     JevSinkTask task = new JevSinkTask(ignored -> output);
@@ -550,6 +606,22 @@ class JevSinkTaskTest {
                       + resolvedModel.get()
                       + "\",\"answers\":{\"department\":\"technical\"},\"usage\":{\"provider\":\"fake\"}}")
                   .getBytes(StandardCharsets.UTF_8);
+          exchange.getResponseHeaders().set("Content-Type", "application/json");
+          exchange.sendResponseHeaders(200, response.length);
+          exchange.getResponseBody().write(response);
+          exchange.close();
+        });
+    server.start();
+    return server;
+  }
+
+  private HttpServer fakeJevResponse(AtomicReference<String> responseBody) throws IOException {
+    HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+    server.createContext(
+        "/evaluate",
+        exchange -> {
+          exchange.getRequestBody().readAllBytes();
+          byte[] response = responseBody.get().getBytes(StandardCharsets.UTF_8);
           exchange.getResponseHeaders().set("Content-Type", "application/json");
           exchange.sendResponseHeaders(200, response.length);
           exchange.getResponseBody().write(response);
