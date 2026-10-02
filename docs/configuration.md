@@ -32,8 +32,8 @@ For the initial low-throughput profile, deployment examples set the standard `co
 | `jev.retry.max.retry_after.ms` | `30000` | Maximum accepted delay from a Jev `Retry-After` header. |
 | `state.raw_bytes.encoding` | `DISABLED` | `DISABLED` or `UTF-8`; controls raw-byte input decoding. |
 | `state.max.bytes` | `0` | Optional UTF-8 Evaluation State limit; `0` disables the connector-side limit. |
-| `output.key.mode` | `ORIGINAL` | `ORIGINAL` or `EVALUATION_ID`. |
-| `output.headers.mode` | `NONE` | `NONE` or `COPY` for input headers; connector-owned provenance headers are unaffected. |
+| `output.key.mode` | `ORIGINAL` | `ORIGINAL` or `EVALUATION_ID` for Enriched Records. Dead-letter keys remain Source ID. |
+| `output.headers.mode` | `NONE` | `NONE` or `COPY` for Enriched Record input headers. Dead-letter output never copies input headers; connector-owned `kafka-jev-evaluation-id` and `kafka-jev-resolved-model` headers are unaffected. |
 | `behavior.on.null.values` | `IGNORE` | `IGNORE`, `DLQ`, or `FAIL` for tombstones. |
 | `errors.transient.exhausted` | `FAIL` | `FAIL` or `DLQ` after transient Jev retries are exhausted. |
 | `output.bootstrap.servers` | none | Required for local operation; Confluent Cloud uses its supplied `kafka.endpoint`. |
