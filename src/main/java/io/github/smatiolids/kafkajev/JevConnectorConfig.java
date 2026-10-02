@@ -27,6 +27,12 @@ final class JevConnectorConfig extends AbstractConfig {
   static final String ENDPOINT = "jev.endpoint";
   static final String ALLOW_HTTP = "jev.allow.insecure.http";
   static final String MODEL = "jev.model";
+  static final String CONNECT_TIMEOUT_MS = "jev.connect.timeout.ms";
+  static final String REQUEST_TIMEOUT_MS = "jev.request.timeout.ms";
+  static final String RETRY_MAX_ATTEMPTS = "jev.retry.max.attempts";
+  static final String RETRY_INITIAL_BACKOFF_MS = "jev.retry.initial.backoff.ms";
+  static final String RETRY_MAX_RETRY_AFTER_MS = "jev.retry.max.retry_after.ms";
+  static final String TRANSIENT_EXHAUSTED = "errors.transient.exhausted";
   static final String OUTPUT_BOOTSTRAP = "output.bootstrap.servers";
 
   private static final ObjectMapper JSON = new ObjectMapper();
@@ -82,6 +88,48 @@ final class JevConnectorConfig extends AbstractConfig {
               "Jev endpoint")
           .define(ALLOW_HTTP, ConfigDef.Type.BOOLEAN, false, ConfigDef.Importance.LOW, "Allow local HTTP")
           .define(MODEL, ConfigDef.Type.STRING, "jev-latest", ConfigDef.Importance.MEDIUM, "Requested model")
+          .define(
+              CONNECT_TIMEOUT_MS,
+              ConfigDef.Type.INT,
+              5000,
+              ConfigDef.Range.atLeast(1),
+              ConfigDef.Importance.MEDIUM,
+              "Jev connection timeout in milliseconds")
+          .define(
+              REQUEST_TIMEOUT_MS,
+              ConfigDef.Type.INT,
+              10000,
+              ConfigDef.Range.atLeast(1),
+              ConfigDef.Importance.MEDIUM,
+              "Jev Evaluation Attempt timeout in milliseconds")
+          .define(
+              RETRY_MAX_ATTEMPTS,
+              ConfigDef.Type.INT,
+              3,
+              ConfigDef.Range.atLeast(1),
+              ConfigDef.Importance.MEDIUM,
+              "Total Jev Evaluation Attempts")
+          .define(
+              RETRY_INITIAL_BACKOFF_MS,
+              ConfigDef.Type.LONG,
+              250L,
+              ConfigDef.Range.atLeast(0L),
+              ConfigDef.Importance.MEDIUM,
+              "Initial retry backoff in milliseconds")
+          .define(
+              RETRY_MAX_RETRY_AFTER_MS,
+              ConfigDef.Type.LONG,
+              30000L,
+              ConfigDef.Range.atLeast(0L),
+              ConfigDef.Importance.MEDIUM,
+              "Maximum accepted Retry-After delay in milliseconds")
+          .define(
+              TRANSIENT_EXHAUSTED,
+              ConfigDef.Type.STRING,
+              "FAIL",
+              ConfigDef.ValidString.in("FAIL", "DLQ"),
+              ConfigDef.Importance.MEDIUM,
+              "Outcome after transient Jev attempts are exhausted")
           .define(
               OUTPUT_BOOTSTRAP,
               ConfigDef.Type.STRING,

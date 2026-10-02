@@ -2,8 +2,10 @@ package io.github.smatiolids.kafkajev;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
+import java.net.http.HttpHeaders;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.ByteBuffer;
@@ -12,12 +14,17 @@ import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 import java.util.Collection;
 import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.function.DoubleSupplier;
 import java.util.function.Function;
+import java.util.function.LongSupplier;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.Producer;
 import org.apache.kafka.clients.producer.ProducerConfig;
@@ -29,7 +36,12 @@ import org.apache.kafka.connect.sink.SinkRecord;
 import org.apache.kafka.connect.sink.SinkTask;
 
 public final class JevSinkTask extends SinkTask {
+  private static final HttpHeaders EMPTY_HEADERS = HttpHeaders.of(Map.of(), (name, value) -> true);
+
   private final Function<Map<String, Object>, Producer<String, String>> producerFactory;
+  private final Sleeper sleeper;
+  private final DoubleSupplier jitterMultiplier;
+  private final LongSupplier monotonicNanos;
   private final ConnectValueCanonicalizer canonicalizer = new ConnectValueCanonicalizer();
   private JevConnectorConfig config;
   private Producer<String, String> producer;
@@ -40,7 +52,22 @@ public final class JevSinkTask extends SinkTask {
   }
 
   JevSinkTask(Function<Map<String, Object>, Producer<String, String>> producerFactory) {
+    this(
+        producerFactory,
+        Thread::sleep,
+        () -> 0.5 + ThreadLocalRandom.current().nextDouble(),
+        System::nanoTime);
+  }
+
+  JevSinkTask(
+      Function<Map<String, Object>, Producer<String, String>> producerFactory,
+      Sleeper sleeper,
+      DoubleSupplier jitterMultiplier,
+      LongSupplier monotonicNanos) {
     this.producerFactory = producerFactory;
+    this.sleeper = sleeper;
+    this.jitterMultiplier = jitterMultiplier;
+    this.monotonicNanos = monotonicNanos;
   }
 
   @Override
@@ -49,7 +76,8 @@ public final class JevSinkTask extends SinkTask {
     producer = producerFactory.apply(producerProperties(config));
     http =
         HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(5))
+            .connectTimeout(
+                Duration.ofMillis(config.getInt(JevConnectorConfig.CONNECT_TIMEOUT_MS)))
             .followRedirects(HttpClient.Redirect.NEVER)
             .build();
   }
@@ -82,7 +110,7 @@ public final class JevSinkTask extends SinkTask {
         && "FAIL".equals(config.getString(JevConnectorConfig.TOMBSTONE_BEHAVIOR))) {
       throw new ConnectException("Tombstone Source Record configured to fail the task");
     }
-    long startedAt = System.nanoTime();
+    long startedAt = monotonicNanos.getAsLong();
     JsonNode canonicalValue =
         canonicalizer.canonicalize(sourceRecord.valueSchema(), sourceRecord.value());
     JsonNode canonicalKey = canonicalizer.canonicalize(sourceRecord.keySchema(), sourceRecord.key());
@@ -126,11 +154,24 @@ public final class JevSinkTask extends SinkTask {
       return;
     }
 
-    InferenceResult inferenceResult = callJev(state);
+    EvaluationSuccess success;
+    try {
+      success = callJev(state);
+    } catch (PermanentRecordException failure) {
+      publishDeadLetter(
+          sourceRecord, canonicalKey, canonicalValue, failure, elapsedMillis(startedAt));
+      return;
+    }
     long durationMillis = elapsedMillis(startedAt);
     ObjectNode enriched =
         enrichedRecord(
-            sourceRecord, canonicalKey, canonicalValue, state, inferenceResult, durationMillis);
+            sourceRecord,
+            canonicalKey,
+            canonicalValue,
+            state,
+            success.inferenceResult(),
+            success.attemptCount(),
+            durationMillis);
     String key = sourceRecord.key() == null ? null : render(canonicalKey);
     ProducerRecord<String, String> output =
         new ProducerRecord<>(
@@ -174,7 +215,7 @@ public final class JevSinkTask extends SinkTask {
     }
     evaluation.set(
         "model", CanonicalJson.object("requested", requestedModel, "resolved", unresolvedModel));
-    evaluation.put("attempt_count", 0);
+    evaluation.put("attempt_count", failure.attemptCount());
     evaluation.put("duration_ms", durationMillis);
     evaluation.put("failed_at", DateTimeFormatter.ISO_INSTANT.format(Instant.now()));
 
@@ -213,34 +254,140 @@ public final class JevSinkTask extends SinkTask {
     }
   }
 
-  private InferenceResult callJev(String state) {
+  private EvaluationSuccess callJev(String state) {
     ObjectNode requestBody = CanonicalJson.MAPPER.createObjectNode();
     requestBody.put("state", state);
     requestBody.set("questions", config.questions());
     requestBody.put("model", config.getString(JevConnectorConfig.MODEL));
     HttpRequest request =
         HttpRequest.newBuilder(URI.create(config.getString(JevConnectorConfig.ENDPOINT)))
-            .timeout(Duration.ofSeconds(10))
+            .timeout(Duration.ofMillis(config.getInt(JevConnectorConfig.REQUEST_TIMEOUT_MS)))
             .header("Authorization", "Bearer " + config.getPassword(JevConnectorConfig.API_KEY).value())
             .header("Content-Type", "application/json")
             .POST(
                 HttpRequest.BodyPublishers.ofString(
                     CanonicalJson.write(requestBody), StandardCharsets.UTF_8))
             .build();
-    try {
-      HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-      if (response.statusCode() != 200) {
-        throw new ConnectException("Jev returned HTTP " + response.statusCode());
+    int maximumAttempts = config.getInt(JevConnectorConfig.RETRY_MAX_ATTEMPTS);
+    for (int attempt = 1; attempt <= maximumAttempts; attempt++) {
+      HttpResponse<String> response = null;
+      try {
+        response =
+            http.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        int status = response.statusCode();
+        if (status == 200) {
+          return new EvaluationSuccess(parseInferenceResult(response.body()), attempt);
+        }
+        if (status == 413) {
+          throw new PermanentRecordException(
+              "JEV_REQUEST",
+              "RECORD_TOO_LARGE",
+              "Jev rejected the Evaluation State as too large",
+              state,
+              attempt);
+        }
+        if (isTaskFatalStatus(status)) {
+          throw new ConnectException("Jev rejected the request with HTTP " + status);
+        }
+        if (!isTransientStatus(status)) {
+          throw new ConnectException("Jev returned an unrecognized HTTP status " + status);
+        }
+      } catch (InterruptedException error) {
+        Thread.currentThread().interrupt();
+        throw new ConnectException("Interrupted while calling Jev", error);
+      } catch (IOException transientFailure) {
+        // Connection failures and per-attempt request timeouts are transient.
       }
-      return InferenceResult.from(CanonicalJson.MAPPER.readTree(response.body()));
-    } catch (InterruptedException error) {
-      Thread.currentThread().interrupt();
-      throw new ConnectException("Interrupted while calling Jev", error);
+
+      if (attempt == maximumAttempts) {
+        if ("DLQ".equals(config.getString(JevConnectorConfig.TRANSIENT_EXHAUSTED))) {
+          throw new PermanentRecordException(
+              "JEV_SERVICE",
+              "TRANSIENT_EXHAUSTED",
+              "Jev Evaluation exhausted transient attempts",
+              state,
+              attempt);
+        }
+        throw new ConnectException(
+            "Jev Evaluation exhausted " + maximumAttempts + " transient attempts");
+      }
+      sleepBeforeRetry(attempt, response == null ? EMPTY_HEADERS : response.headers());
+    }
+    throw new AssertionError("Configured Jev attempt limit was not applied");
+  }
+
+  private InferenceResult parseInferenceResult(String responseBody) {
+    try {
+      return InferenceResult.from(CanonicalJson.MAPPER.readTree(responseBody));
     } catch (ConnectException error) {
       throw error;
     } catch (Exception error) {
-      throw new ConnectException("Failed to call Jev", error);
+      throw new ConnectException("Jev response is not valid JSON");
     }
+  }
+
+  private void sleepBeforeRetry(int completedAttempt, HttpHeaders responseHeaders) {
+    long localBackoff = exponentialBackoff(completedAttempt);
+    long retryAfter = retryAfterMillis(responseHeaders);
+    long delay = Math.max(localBackoff, retryAfter);
+    try {
+      sleeper.sleep(delay);
+    } catch (InterruptedException error) {
+      Thread.currentThread().interrupt();
+      throw new ConnectException("Interrupted while waiting to retry Jev", error);
+    }
+  }
+
+  private long exponentialBackoff(int completedAttempt) {
+    long initial = config.getLong(JevConnectorConfig.RETRY_INITIAL_BACKOFF_MS);
+    long exponential = initial;
+    for (int i = 1; i < completedAttempt; i++) {
+      exponential = exponential > Long.MAX_VALUE / 2 ? Long.MAX_VALUE : exponential * 2;
+    }
+    double jittered = exponential * boundedJitterMultiplier();
+    return jittered >= Long.MAX_VALUE ? Long.MAX_VALUE : Math.max(0L, Math.round(jittered));
+  }
+
+  private double boundedJitterMultiplier() {
+    return Math.max(0.5, Math.min(1.5, jitterMultiplier.getAsDouble()));
+  }
+
+  private long retryAfterMillis(HttpHeaders headers) {
+    String configured = headers.firstValue("Retry-After").orElse(null);
+    if (configured == null) {
+      return 0;
+    }
+    long maximum = config.getLong(JevConnectorConfig.RETRY_MAX_RETRY_AFTER_MS);
+    long requested;
+    try {
+      long seconds = Long.parseLong(configured.strip());
+      if (seconds < 0) {
+        return 0;
+      }
+      requested = seconds > maximum / 1000L ? maximum : seconds * 1000L;
+    } catch (NumberFormatException notDeltaSeconds) {
+      try {
+        requested =
+            Math.max(
+                0L,
+                Duration.between(
+                        Instant.now(),
+                        ZonedDateTime.parse(configured, DateTimeFormatter.RFC_1123_DATE_TIME)
+                            .toInstant())
+                    .toMillis());
+      } catch (DateTimeParseException invalidHeader) {
+        return 0;
+      }
+    }
+    return Math.min(requested, maximum);
+  }
+
+  private static boolean isTaskFatalStatus(int status) {
+    return status == 400 || status == 401 || status == 403 || status == 404 || status == 422;
+  }
+
+  private static boolean isTransientStatus(int status) {
+    return status == 408 || status == 429 || status == 529 || (status >= 500 && status <= 599);
   }
 
   private ObjectNode enrichedRecord(
@@ -249,6 +396,7 @@ public final class JevSinkTask extends SinkTask {
       JsonNode canonicalValue,
       String state,
       InferenceResult inferenceResult,
+      int attemptCount,
       long durationMillis) {
     String sourceId = sourceId(sourceRecord);
     String questionSetHash = DeterministicIds.questionSetHash(config.questions());
@@ -275,7 +423,7 @@ public final class JevSinkTask extends SinkTask {
         "model",
         CanonicalJson.object(
             "requested", config.getString(JevConnectorConfig.MODEL), "resolved", resolvedModel));
-    evaluation.put("attempt_count", 1);
+    evaluation.put("attempt_count", attemptCount);
     evaluation.put("duration_ms", durationMillis);
     evaluation.put("completed_at", DateTimeFormatter.ISO_INSTANT.format(Instant.now()));
 
@@ -345,8 +493,8 @@ public final class JevSinkTask extends SinkTask {
     return CanonicalJson.serialize(value);
   }
 
-  private static long elapsedMillis(long startedAt) {
-    return Math.max(1, (System.nanoTime() - startedAt + 999_999) / 1_000_000);
+  private long elapsedMillis(long startedAt) {
+    return Math.max(1, (monotonicNanos.getAsLong() - startedAt + 999_999) / 1_000_000);
   }
 
   private static String sanitize(String message) {
@@ -408,5 +556,12 @@ public final class JevSinkTask extends SinkTask {
     Map<String, Object> result = (Map) properties;
     return result;
   }
+
+  @FunctionalInterface
+  interface Sleeper {
+    void sleep(long milliseconds) throws InterruptedException;
+  }
+
+  private record EvaluationSuccess(InferenceResult inferenceResult, int attemptCount) {}
 
 }
