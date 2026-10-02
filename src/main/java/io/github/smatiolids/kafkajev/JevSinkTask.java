@@ -29,6 +29,8 @@ import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.Producer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.errors.ConnectException;
@@ -46,6 +48,7 @@ public final class JevSinkTask extends SinkTask {
   private JevConnectorConfig config;
   private Producer<String, String> producer;
   private HttpClient http;
+  private volatile boolean batchFailed;
 
   public JevSinkTask() {
     this(properties -> new KafkaProducer<>(properties));
@@ -84,9 +87,21 @@ public final class JevSinkTask extends SinkTask {
 
   @Override
   public void put(Collection<SinkRecord> records) {
-    for (SinkRecord sourceRecord : records) {
-      evaluateAndPublish(sourceRecord);
+    batchFailed = false;
+    try {
+      for (SinkRecord sourceRecord : records) {
+        evaluateAndPublish(sourceRecord);
+      }
+    } catch (RuntimeException failure) {
+      batchFailed = true;
+      throw failure;
     }
+  }
+
+  @Override
+  public Map<TopicPartition, OffsetAndMetadata> preCommit(
+      Map<TopicPartition, OffsetAndMetadata> currentOffsets) {
+    return batchFailed ? Map.of() : super.preCommit(currentOffsets);
   }
 
   @Override
