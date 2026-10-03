@@ -144,3 +144,18 @@ The version appears in several places. Update all of them together:
 - `src/test/java/.../SmokeEnvironmentIT.java`
 
 Then run `mvn verify` and `./scripts/smoke-test.sh`.
+
+## Releasing
+
+1. Change the version as described above and merge to `main`.
+2. Tag the merge commit with the same version, prefixed with `v`, and push the tag:
+
+   ```bash
+   git tag -a v0.2 -m "v0.2"
+   git push origin v0.2
+   ```
+
+The [release workflow](.github/workflows/release.yml) checks that the tag matches the
+`pom.xml` version, runs `mvn verify`, and creates a GitHub release with the plugin ZIP and
+its SHA-256 checksum attached. It does not run the smoke test, so run
+`./scripts/smoke-test.sh` locally before tagging.

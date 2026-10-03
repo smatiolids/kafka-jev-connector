@@ -1,5 +1,8 @@
 # Kafka Jev Connector
 
+[![CI](https://github.com/smatiolids/kafka-jev-connector/actions/workflows/ci.yml/badge.svg)](https://github.com/smatiolids/kafka-jev-connector/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/smatiolids/kafka-jev-connector)](https://github.com/smatiolids/kafka-jev-connector/releases/latest)
+
 Ask questions about your Kafka messages with an AI model, and get the answers back as Kafka messages.
 
 `kafka-jev-connector` is a Kafka Connect sink connector. It reads records from your input
@@ -63,8 +66,12 @@ You need:
 - A Kafka cluster with Kafka Connect 4.2 (Confluent Cloud custom connectors or a
   self-managed worker)
 - A TypeSafe AI API key
-- The plugin ZIP, `kafka-jev-connector-<version>-plugin.zip`. To build it, run
-  `mvn package` and pick it up from `target/` (see [DEVELOPMENT.md](DEVELOPMENT.md)).
+- The plugin ZIP, `kafka-jev-connector-<version>-plugin.zip`. Download it from the
+  [latest release](https://github.com/smatiolids/kafka-jev-connector/releases/latest),
+  along with its `.sha256` file, and check it with
+  `shasum -a 256 -c kafka-jev-connector-<version>-plugin.zip.sha256`. To build it
+  yourself instead, run `mvn package` and pick it up from `target/` (see
+  [DEVELOPMENT.md](DEVELOPMENT.md)).
 
 The steps below use Confluent Cloud.
 
