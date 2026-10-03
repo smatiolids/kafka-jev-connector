@@ -1,0 +1,24 @@
+Third-party runtime dependencies
+================================
+
+The plugin ZIP contains the following runtime dependencies. Each is licensed
+under the Apache License, Version 2.0, a copy of which is included in LICENSE.
+
+Jackson Annotations 2.20
+Copyright FasterXML, LLC and Jackson contributors
+https://github.com/FasterXML/jackson-annotations
+
+Jackson Core 2.20.0
+Copyright FasterXML, LLC and Jackson contributors
+https://github.com/FasterXML/jackson-core
+
+Jackson Databind 2.20.0
+Copyright FasterXML, LLC and Jackson contributors
+https://github.com/FasterXML/jackson-databind
+
+Java JSON Canonicalization 1.1
+Copyright Anders Rundgren, Samuel Erdtman, and contributors
+https://github.com/erdtman/java-json-canonicalization
+
+Kafka Connect, Kafka client, and logging APIs are supplied by the runtime and
+are intentionally not included in the plugin ZIP.
