@@ -133,6 +133,9 @@ ZIP into the worker's `plugin.path` and register the same configuration through 
 Connect REST API, replacing `kafka.api.key`/`kafka.api.secret` with
 `output.bootstrap.servers` for an unauthenticated cluster.
 
+For a more complete, end-to-end working demo, see
+[kafka_jev_demo](https://github.com/smatiolids/kafka_jev_demo).
+
 ## Example
 
 With the configuration above, the Question Set asks one question, `friendly`, scored on
@@ -272,6 +275,8 @@ Each Enriched Record also carries two headers, `kafka-jev-evaluation-id` and
   hashing, and templates
 - [CONTEXT.md](CONTEXT.md): domain glossary
 - [DEVELOPMENT.md](DEVELOPMENT.md): building, testing, and contributing
+- [kafka_jev_demo](https://github.com/smatiolids/kafka_jev_demo): a more complete,
+  end-to-end working demo
 
 ## License
 
