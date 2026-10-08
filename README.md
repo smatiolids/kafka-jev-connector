@@ -14,6 +14,10 @@ and deduplicate each evaluation.
 Typical uses: classifying support tickets, scoring sentiment or tone, routing messages to
 teams, or flagging content, all without writing a consumer service.
 
+[![Watch the Kafka Jev Connector demo](https://img.youtube.com/vi/C1CLjmetbmI/maxresdefault.jpg)](https://youtu.be/C1CLjmetbmI)
+
+**[Watch the Kafka Jev Connector demo on YouTube](https://youtu.be/C1CLjmetbmI)**
+
 | | |
 | --- | --- |
 | **Runtime** | Kafka Connect 4.2, Java 17 |
