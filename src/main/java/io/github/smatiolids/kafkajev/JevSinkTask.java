@@ -97,7 +97,7 @@ public final class JevSinkTask extends SinkTask {
     envelopes = new EvaluationEnvelopeFactory(config);
     producer =
         new KafkaPublicationFactory(config, producerFactory, topicExistenceValidator)
-            .create(Set.of(config.outputTopic(), config.deadLetterTopic()));
+            .create(publicationTopics(config));
     batchWorkers =
         Executors.newFixedThreadPool(config.getInt(JevConnectorConfig.MAX_IN_FLIGHT));
     jevClient = new JevClient(config, sleeper, jitterMultiplier);
@@ -248,13 +248,20 @@ public final class JevSinkTask extends SinkTask {
             : sourceRecord.key() == null ? null : render(canonicalKey);
     ProducerRecord<String, String> output =
         new ProducerRecord<>(
-            config.outputTopic(),
+            config.destinationPolicy().resolve(success.inferenceResult()),
             null,
             sourceRecord.timestamp(),
             key,
             CanonicalJson.write(enriched.json()),
             enrichedHeaders(sourceRecord, enriched.evaluationId(), enriched.effectiveModel()));
     publish(output, "Enriched Record");
+  }
+
+  private static Set<String> publicationTopics(JevConnectorConfig config) {
+    java.util.LinkedHashSet<String> topics =
+        new java.util.LinkedHashSet<>(config.destinationPolicy().candidates());
+    topics.add(config.deadLetterTopic());
+    return Set.copyOf(topics);
   }
 
   private void publishDeadLetter(

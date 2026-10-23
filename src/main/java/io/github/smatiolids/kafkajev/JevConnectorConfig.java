@@ -190,12 +190,14 @@ final class JevConnectorConfig extends AbstractConfig {
   private final TransientExhaustedBehavior transientExhaustedBehavior;
   private final OutputKeyMode outputKeyMode;
   private final OutputHeadersMode outputHeadersMode;
+  private final DestinationPolicy destinationPolicy;
 
   JevConnectorConfig(Map<String, ?> properties) {
     super(CONFIG_DEF, properties);
     validateRequiredValues();
-    validateTopics();
     validateQuestions();
+    destinationPolicy = DestinationPolicy.compile(getString(OUTPUT_TOPIC).trim(), questions());
+    validateTopics();
     validateEndpoint();
     validateStatePolicy();
     validateKafkaConnection();
@@ -267,13 +269,13 @@ final class JevConnectorConfig extends AbstractConfig {
 
   Set<String> allTopics() {
     LinkedHashSet<String> topics = new LinkedHashSet<>(inputTopics());
-    topics.add(getString(OUTPUT_TOPIC).trim());
+    topics.addAll(destinationPolicy.candidates());
     topics.add(getString(DLQ_TOPIC).trim());
     return Set.copyOf(topics);
   }
 
-  String outputTopic() {
-    return getString(OUTPUT_TOPIC).trim();
+  DestinationPolicy destinationPolicy() {
+    return destinationPolicy;
   }
 
   String deadLetterTopic() {
@@ -324,10 +326,14 @@ final class JevConnectorConfig extends AbstractConfig {
         throw new ConfigException(TOPICS, null, "must contain unique, non-empty explicit topics");
       }
     }
-    String output = getString(OUTPUT_TOPIC).trim();
     String dlq = getString(DLQ_TOPIC).trim();
-    if (inputTopics.contains(output) || inputTopics.contains(dlq) || output.equals(dlq)) {
-      throw new ConfigException("Input, output, and dead-letter topics must be distinct");
+    if (inputTopics.contains(dlq)) {
+      throw new ConfigException("Input, destination, and dead-letter topics must be distinct");
+    }
+    for (String destination : destinationPolicy.candidates()) {
+      if (inputTopics.contains(destination) || destination.equals(dlq)) {
+        throw new ConfigException("Input, destination, and dead-letter topics must be distinct");
+      }
     }
   }
 

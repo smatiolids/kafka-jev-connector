@@ -41,6 +41,7 @@ final class PluginPackagingIT {
           "doc/THIRD-PARTY-NOTICES",
           "doc/README.md",
           "doc/SETUP.md",
+          "doc/RELEASE_NOTES.md",
           "doc/configuration.md",
           "doc/record-contracts.md",
           "etc/local-connector.json",
@@ -98,7 +99,7 @@ final class PluginPackagingIT {
 
   private static void assertCommonConnectorConfig(JsonNode config) {
     assertEquals("jev-input", config.path("topics").asText());
-    assertEquals("jev-output", config.path("output.topic").asText());
+    assertEquals("jev-${answers.department.choice}", config.path("output.topic").asText());
     assertEquals("jev-dlq", config.path("errors.deadletter.topic").asText());
     assertEquals("org.apache.kafka.connect.storage.StringConverter", config.path("key.converter").asText());
     assertEquals("org.apache.kafka.connect.json.JsonConverter", config.path("value.converter").asText());

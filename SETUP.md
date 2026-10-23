@@ -90,7 +90,7 @@ Runtime availability changes over time. Do not silently select an older runtime 
 Pre-create all topics. The connector never creates them:
 
 - Every explicit input topic
-- The Enriched Record output topic
+- Every possible Enriched Record Destination Topic derived from `output.topic`
 - The permanent-failure dead-letter topic
 
 Choose partition counts, retention, compaction, and replication intentionally. Input, output, and dead-letter topics must be distinct. Regex input subscriptions are not supported.
@@ -99,7 +99,7 @@ Grant the dedicated service-account API key only the access it needs:
 
 - `READ` and `DESCRIBE` on each input topic
 - Consumer-group access required by the managed sink connector
-- `WRITE` and `DESCRIBE` on the output topic
+- `WRITE` and `DESCRIBE` on every possible Destination Topic
 - `WRITE` and `DESCRIBE` on the dead-letter topic
 
 Do not grant topic-creation or broad cluster-administration access. Confluent Cloud's connector creation flow accepts an existing Kafka API key and secret; use the key owned by this dedicated service account so both the managed sink consumer and plugin-owned producer operate under the same principal.
@@ -155,7 +155,7 @@ The essential configuration is equivalent to:
     "key.converter": "org.apache.kafka.connect.storage.StringConverter",
     "value.converter": "org.apache.kafka.connect.json.JsonConverter",
     "value.converter.schemas.enable": "false",
-    "output.topic": "jev-output",
+    "output.topic": "jev-${answers.department.choice}",
     "errors.deadletter.topic": "jev-dlq",
     "question.set.id": "support-routing/v1",
     "jev.api.key": "<typesafe-api-key>",
@@ -171,13 +171,19 @@ The essential configuration is equivalent to:
 }
 ```
 
+This Choice policy has the bounded destination set `jev-billing`, `jev-technical`, and
+`jev-sales`, derived from the configured criteria. Pre-create all three and grant the
+connector principal access to each. A literal such as `jev-output` remains valid when
+routing is not needed. See [Connector Configuration](docs/configuration.md#destination-policies)
+for Choice, Score Level, Noul threshold, and Score Value threshold examples.
+
 For Avro, JSON Schema, or Protobuf input, select the corresponding standard converter and configure Confluent Cloud Schema Registry. The connector receives normalized Kafka Connect values and does not implement wire-format decoding itself.
 
 ## Verify Cloud Deployment
 
 1. Confirm the Connector Instance reaches `RUNNING`.
 2. Produce one non-sensitive test Source Record to an input topic.
-3. Confirm one Enriched Record appears in the output topic with the expected Source ID, Evaluation ID, Question Set ID/hash, state hash, resolved model, and unchanged `jev` response.
+3. Confirm one Enriched Record appears in the selected Destination Topic with the expected Source ID, Evaluation ID, Question Set ID/hash, state hash, resolved model, and unchanged `jev` response.
 4. Confirm no record payload or generated Evaluation State appears in the connector application log topic.
 5. Test a missing required template reference and confirm one sanitized Dead-Letter Record appears.
 6. Test a temporary fake or controlled service failure outside production and confirm transient exhaustion leaves the batch uncommitted rather than draining input to the dead-letter topic.

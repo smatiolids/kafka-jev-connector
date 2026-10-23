@@ -108,6 +108,69 @@ class JevSinkConnectorTest {
   }
 
   @Test
+  void compilesEveryBoundedDestinationPolicyAndEnumeratesItsCandidateTopics() {
+    Map<String, String> base = routingConfig();
+    Map<String, Set<String>> cases =
+        Map.of(
+            "events-${answers.department.choice}",
+                Set.of("events-billing", "events-technical", "events-sales"),
+            "risk-${answers.urgency.level}", Set.of("risk-0", "risk-1", "risk-2"),
+            "queue-${answers.escalate.noul >= 0.5; \"human\", \"auto\"}",
+                Set.of("queue-human", "queue-auto"),
+            "priority-${answers.urgency.score < 1.5; \"normal\", \"urgent\"}",
+                Set.of("priority-normal", "priority-urgent"));
+
+    for (Map.Entry<String, Set<String>> testCase : cases.entrySet()) {
+      AtomicReference<Set<String>> checked = new AtomicReference<>();
+      Map<String, String> config = new HashMap<>(base);
+      config.put("output.topic", testCase.getKey());
+      new JevSinkConnector((topics, properties) -> checked.set(Set.copyOf(topics))).start(config);
+
+      Set<String> expected = new java.util.HashSet<>(testCase.getValue());
+      expected.add("support-input");
+      expected.add("support-dlq");
+      assertEquals(expected, checked.get());
+    }
+
+    for (String operator : List.of(">", ">=", "<", "<=")) {
+      Map<String, String> config = new HashMap<>(base);
+      config.put(
+          "output.topic",
+          "route-${answers.escalate.noul " + operator + " 0.5; \"yes\", \"no\"}");
+      connector().start(config);
+    }
+  }
+
+  @Test
+  void rejectsUnboundedMalformedMismatchedAndUnreachableDestinationPolicies() {
+    Map<String, String> base = routingConfig();
+    for (String policy :
+        List.of(
+            "${answers.missing.choice}",
+            "${answers.urgency.choice}",
+            "${answers.department.score}",
+            "${answers.department.choice}-${answers.department.choice}",
+            "${answers.department}",
+            "${answers.department.choice == \"billing\"; \"a\", \"b\"}",
+            "${answers.urgency.score}",
+            "${answers.escalate.noul == 0.5; \"a\", \"b\"}",
+            "${answers.escalate.noul > 1; \"a\", \"b\"}",
+            "${answers.urgency.score <= 2; \"a\", \"b\"}",
+            "${answers.escalate.noul > NaN; \"a\", \"b\"}",
+            "${answers.escalate.noul > 0.5; answers.department.choice, \"b\"}",
+            "bad topic-${answers.department.choice}")) {
+      Map<String, String> config = new HashMap<>(base);
+      config.put("output.topic", policy);
+      assertThrows(ConfigException.class, () -> connector().start(config), policy);
+    }
+
+    Map<String, String> overlap = new HashMap<>(base);
+    overlap.put("output.topic", "support-${answers.department.choice}");
+    overlap.put("topics", "support-input,support-billing");
+    assertThrows(ConfigException.class, () -> connector().start(overlap));
+  }
+
+  @Test
   void selectsLocalOrCloudKafkaConnectionWithoutAcceptingProducerOverrides() {
     AtomicReference<Map<String, Object>> localProperties = new AtomicReference<>();
     JevSinkTask localTask =
@@ -204,6 +267,16 @@ class JevSinkConnectorTest {
     result.put("kafka.endpoint", "pkc.example:9092");
     result.put("kafka.api.key", "cloud-key");
     result.put("kafka.api.secret", "cloud-secret");
+    return result;
+  }
+
+  private Map<String, String> routingConfig() {
+    Map<String, String> result = localConfig();
+    result.put(
+        "jev.questions",
+        "{\"department\":{\"type\":\"choice\",\"criteria\":{\"billing\":\"B\",\"technical\":\"T\",\"sales\":\"S\"}},"
+            + "\"urgency\":{\"type\":\"score\",\"criteria\":[\"low\",\"medium\",\"high\"]},"
+            + "\"escalate\":{\"type\":\"noul\"}}");
     return result;
   }
 }

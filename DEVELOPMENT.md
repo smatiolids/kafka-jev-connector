@@ -72,13 +72,14 @@ fake Jev service, so you don't need a TypeSafe API key. The script:
 1. Builds the plugin ZIP.
 2. Starts Kafka 4.2, Kafka Connect 4.2 with the plugin installed, and a deterministic fake
    Jev endpoint ([compose.yaml](compose.yaml)).
-3. Creates `jev-input`, `jev-output`, and `jev-dlq` and registers
+3. Creates `jev-input`, the routed `jev-billing`, `jev-technical`, and `jev-sales`
+   destinations, and `jev-dlq`, then registers
    [config/local-connector.json](config/local-connector.json).
 4. Checks four paths and prints a checkpoint for each:
 
 | Checkpoint | What it proves |
 | --- | --- |
-| `ENRICHED_RECORD_OK` | A normal message becomes a contract-compliant Enriched Record |
+| `ENRICHED_RECORD_OK` | A normal message is routed to `jev-technical` as a contract-compliant Enriched Record |
 | `SANITIZED_DEAD_LETTER_OK` | A Jev `413` becomes a Dead-Letter Record with no raw response body or secrets |
 | `TRANSIENT_UNCOMMITTED_OK` | Repeated `503`s exhaust retries, fail the task, and leave the offset uncommitted |
 | `LOG_BOUNDARY_OK` | Connect and fake-Jev logs contain no API key, payload, or Evaluation State |

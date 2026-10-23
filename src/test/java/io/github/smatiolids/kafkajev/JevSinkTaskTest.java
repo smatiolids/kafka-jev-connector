@@ -155,6 +155,196 @@ class JevSinkTaskTest {
   }
 
   @Test
+  void routesByChoiceWhilePreservingTheCompleteInferenceResultAndPublicationContract()
+      throws Exception {
+    String response =
+        "{\"model\":\"jev-1.13.0\",\"answers\":{"
+            + "\"department\":{\"type\":\"choice\",\"choice\":\"technical\",\"confidence\":0.8},"
+            + "\"future\":{\"unexpected\":[null,false,17]}},\"usage\":{\"provider\":\"fake\"}}";
+    fakeJev = fakeJevResponse(new AtomicReference<>(response));
+    MockProducer<String, String> output = output();
+    AtomicReference<Set<String>> checked = new AtomicReference<>();
+    JevSinkTask task =
+        new JevSinkTask(
+            ignored -> output, (topics, properties) -> checked.set(Set.copyOf(topics)));
+    Map<String, String> routed =
+        routingConfig(
+            "team-${answers.department.choice}-v1",
+            "{\"department\":{\"type\":\"choice\",\"criteria\":{\"billing\":\"B\",\"technical\":\"T\"}}}");
+    task.start(routed);
+
+    task.put(List.of(sourceRecord(null, "customer-42", null, "same source")));
+
+    assertEquals(Set.of("team-billing-v1", "team-technical-v1", "support-dlq"), checked.get());
+    assertEquals(1, output.history().size());
+    ProducerRecord<String, String> published = output.history().get(0);
+    assertEquals("team-technical-v1", published.topic());
+    assertEquals(null, published.partition());
+    assertEquals("customer-42", published.key());
+    assertEquals(JSON.readTree(response), JSON.readTree(published.value()).path("jev"));
+    task.stop();
+  }
+
+  @Test
+  void routesByHighestScoreLevelAndBreaksEveryTieTowardTheHigherLevel() throws Exception {
+    AtomicReference<String> response = new AtomicReference<>();
+    fakeJev = fakeJevResponse(response);
+    MockProducer<String, String> output = output();
+    JevSinkTask task = new JevSinkTask(ignored -> output);
+    task.start(
+        routingConfig(
+            "risk-${answers.urgency.level}",
+            "{\"urgency\":{\"type\":\"score\",\"criteria\":[\"low\",\"medium\",\"high\"]}}"));
+
+    response.set(scoreResponse("{\"0\":0.8,\"1\":0.1,\"2\":0.1}", null));
+    task.put(List.of(sourceRecord(201, "first")));
+    response.set(scoreResponse("{\"0\":0.1,\"1\":0.8,\"2\":0.8}", null));
+    task.put(List.of(sourceRecord(202, "second")));
+    response.set(scoreResponse("{\"0\":0.5,\"1\":0.5,\"2\":0.5}", null));
+    task.put(List.of(sourceRecord(203, "third")));
+
+    assertEquals(List.of("risk-0", "risk-2", "risk-2"), output.history().stream().map(ProducerRecord::topic).toList());
+    task.stop();
+  }
+
+  @Test
+  void routesNoulThresholdsOnBothSidesAndAtEveryOperatorBoundary() throws Exception {
+    AtomicReference<String> response = new AtomicReference<>();
+    fakeJev = fakeJevResponse(response);
+    record Case(String operator, double value, String expected) {}
+    List<Case> cases =
+        List.of(
+            new Case(">", 0.4, "route-no"), new Case(">", 0.5, "route-no"), new Case(">", 0.6, "route-yes"),
+            new Case(">=", 0.4, "route-no"), new Case(">=", 0.5, "route-yes"), new Case(">=", 0.6, "route-yes"),
+            new Case("<", 0.4, "route-yes"), new Case("<", 0.5, "route-no"), new Case("<", 0.6, "route-no"),
+            new Case("<=", 0.4, "route-yes"), new Case("<=", 0.5, "route-yes"), new Case("<=", 0.6, "route-no"));
+
+    int offset = 300;
+    for (Case testCase : cases) {
+      response.set(
+          "{\"model\":\"jev-1.13.0\",\"answers\":{\"escalate\":{\"type\":\"noul\",\"noul\":"
+              + testCase.value()
+              + "}}}");
+      MockProducer<String, String> output = output();
+      JevSinkTask task = new JevSinkTask(ignored -> output);
+      task.start(
+          routingConfig(
+              "route-${answers.escalate.noul "
+                  + testCase.operator()
+                  + " 0.5; \"yes\", \"no\"}",
+              "{\"escalate\":{\"type\":\"noul\"}}"));
+      task.put(List.of(sourceRecord(offset++, "value")));
+      assertEquals(testCase.expected(), output.history().get(0).topic(), testCase.toString());
+      task.stop();
+    }
+  }
+
+  @Test
+  void routesContinuousScoreValuesIncludingValuesBetweenLevelsAndBoundaries()
+      throws Exception {
+    AtomicReference<String> response = new AtomicReference<>();
+    fakeJev = fakeJevResponse(response);
+    record Case(String operator, double value, String expected) {}
+    for (Case testCase :
+        List.of(
+            new Case(">", 0.75, "priority-normal"),
+            new Case(">", 1.0, "priority-normal"),
+            new Case(">", 1.25, "priority-urgent"),
+            new Case(">=", 1.0, "priority-urgent"),
+            new Case("<", 1.0, "priority-normal"),
+            new Case("<=", 1.0, "priority-urgent"))) {
+      response.set(scoreResponse("{\"0\":0.2,\"1\":0.7,\"2\":0.1}", testCase.value()));
+      MockProducer<String, String> output = output();
+      JevSinkTask task = new JevSinkTask(ignored -> output);
+      task.start(
+          routingConfig(
+              "priority-${answers.urgency.score "
+                  + testCase.operator()
+                  + " 1; \"urgent\", \"normal\"}",
+              "{\"urgency\":{\"type\":\"score\",\"criteria\":[\"low\",\"medium\",\"high\"]}}"));
+      task.put(List.of(sourceRecord(400, "value")));
+      assertEquals(testCase.expected(), output.history().get(0).topic(), testCase.toString());
+      task.stop();
+    }
+  }
+
+  @Test
+  void routingContractViolationsPublishNothingAndLeaveTheBatchUncommitted() throws Exception {
+    AtomicReference<String> response = new AtomicReference<>();
+    fakeJev = fakeJevResponse(response);
+    MockProducer<String, String> output = output();
+    JevSinkTask task = new JevSinkTask(ignored -> output);
+    task.start(
+        routingConfig(
+            "team-${answers.department.choice}",
+            "{\"department\":{\"type\":\"choice\",\"criteria\":{\"billing\":\"B\",\"technical\":\"T\"}}}"));
+
+    for (String invalid :
+        List.of(
+            "{\"model\":\"jev-1.13.0\",\"answers\":{}}",
+            "{\"model\":\"jev-1.13.0\",\"answers\":{\"department\":\"technical\"}}",
+            "{\"model\":\"jev-1.13.0\",\"answers\":{\"department\":{\"type\":\"score\",\"choice\":\"technical\"}}}",
+            "{\"model\":\"jev-1.13.0\",\"answers\":{\"department\":{\"type\":\"choice\"}}}",
+            "{\"model\":\"jev-1.13.0\",\"answers\":{\"department\":{\"type\":\"choice\",\"choice\":\"unknown\"}}}")) {
+      response.set(invalid);
+      assertThrows(
+          DestinationPolicy.RoutingContractViolation.class,
+          () -> task.put(List.of(sourceRecord(500, "value"))));
+      assertEquals(0, output.history().size());
+      assertEquals(
+          Map.of(),
+          task.preCommit(
+              Map.of(new TopicPartition("support-input", 2), new OffsetAndMetadata(501))));
+    }
+    task.stop();
+  }
+
+  @Test
+  void rejectsInvalidNoulScoreAndLevelRuntimeValuesWithoutPublishing() throws Exception {
+    AtomicReference<String> response = new AtomicReference<>();
+    fakeJev = fakeJevResponse(response);
+    record Case(String policy, String questions, String answer) {}
+    List<Case> cases =
+        List.of(
+            new Case(
+                "route-${answers.escalate.noul > 0.5; \"yes\", \"no\"}",
+                "{\"escalate\":{\"type\":\"noul\"}}",
+                "{\"escalate\":{\"type\":\"noul\",\"noul\":1.1}}"),
+            new Case(
+                "route-${answers.escalate.noul > 0.5; \"yes\", \"no\"}",
+                "{\"escalate\":{\"type\":\"noul\"}}",
+                "{\"escalate\":{\"type\":\"noul\",\"noul\":\"high\"}}"),
+            new Case(
+                "risk-${answers.urgency.score > 1; \"high\", \"low\"}",
+                "{\"urgency\":{\"type\":\"score\",\"criteria\":[\"a\",\"b\",\"c\"]}}",
+                "{\"urgency\":{\"type\":\"score\",\"score\":3}}"),
+            new Case(
+                "risk-${answers.urgency.level}",
+                "{\"urgency\":{\"type\":\"score\",\"criteria\":[\"a\",\"b\",\"c\"]}}",
+                "{\"urgency\":{\"type\":\"score\",\"probabilities\":{\"0\":0.4,\"1\":0.6}}}"),
+            new Case(
+                "risk-${answers.urgency.level}",
+                "{\"urgency\":{\"type\":\"score\",\"criteria\":[\"a\",\"b\",\"c\"]}}",
+                "{\"urgency\":{\"type\":\"score\",\"probabilities\":{\"0\":0.4,\"1\":0.5,\"3\":0.1}}}"),
+            new Case(
+                "risk-${answers.urgency.level}",
+                "{\"urgency\":{\"type\":\"score\",\"criteria\":[\"a\",\"b\",\"c\"]}}",
+                "{\"urgency\":{\"type\":\"score\",\"probabilities\":{\"0\":0.4,\"1\":1.1,\"2\":0.1}}}"));
+
+    for (Case testCase : cases) {
+      response.set("{\"model\":\"jev-1.13.0\",\"answers\":" + testCase.answer() + "}");
+      MockProducer<String, String> output = output();
+      JevSinkTask task = new JevSinkTask(ignored -> output);
+      task.start(routingConfig(testCase.policy(), testCase.questions()));
+      assertThrows(
+          DestinationPolicy.RoutingContractViolation.class,
+          () -> task.put(List.of(sourceRecord(600, "value"))));
+      assertEquals(0, output.history().size());
+      task.stop();
+    }
+  }
+
+  @Test
   void evaluationIdKeyModeUsesTheDeterministicEvaluationId() throws Exception {
     fakeJev = fakeJev(new AtomicReference<>());
     Map<String, String> evaluationIdKeys = new java.util.HashMap<>(config());
@@ -1478,6 +1668,21 @@ class JevSinkTaskTest {
         Map.entry("jev.endpoint", endpoint),
         Map.entry("jev.allow.insecure.http", "true"),
         Map.entry("output.bootstrap.servers", "unused:9092"));
+  }
+
+  private Map<String, String> routingConfig(String policy, String questions) {
+    Map<String, String> result = new java.util.HashMap<>(config());
+    result.put("output.topic", policy);
+    result.put("jev.questions", questions);
+    return result;
+  }
+
+  private String scoreResponse(String probabilities, Double score) {
+    return "{\"model\":\"jev-1.13.0\",\"answers\":{\"urgency\":{\"type\":\"score\""
+        + (score == null ? "" : ",\"score\":" + score)
+        + ",\"probabilities\":"
+        + probabilities
+        + "}}}";
   }
 
   private Map<String, String> requiredTemplateConfig() {

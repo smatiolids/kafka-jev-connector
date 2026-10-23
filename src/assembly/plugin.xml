@@ -43,6 +43,7 @@
         <include>THIRD-PARTY-NOTICES</include>
         <include>README.md</include>
         <include>SETUP.md</include>
+        <include>RELEASE_NOTES.md</include>
       </includes>
     </fileSet>
     <fileSet>

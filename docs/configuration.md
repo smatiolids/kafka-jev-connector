@@ -9,7 +9,7 @@ For the initial low-throughput profile, deployment examples set the standard `co
 | Property | Meaning |
 | --- | --- |
 | `topics` | Explicit comma-separated input topics. Regex subscriptions are not supported. |
-| `output.topic` | Pre-created topic that receives Enriched Records. It must not be an input or dead-letter topic. |
+| `output.topic` | Literal Destination Topic or bounded Destination Policy for Enriched Records. Every possible destination must be pre-created and must not be an input or dead-letter topic. |
 | `errors.deadletter.topic` | Pre-created topic that receives permanent record-specific failures. It must not be an input or output topic. |
 | `question.set.id` | Immutable, human-readable Question Set identity, such as `fraud-screening/v1`. |
 | `jev.api.key` | TypeSafe AI API key. This is a masked password property. |
@@ -46,7 +46,40 @@ For local operation, `output.bootstrap.servers` identifies the Kafka brokers use
 
 The connector does not expose arbitrary producer overrides. Idempotence, `acks=all`, serializers, Cloud security protocol, and retry classification are mandatory behavior.
 
-The connector uses the Kafka Admin API to describe every configured input, output, and dead-letter topic when the Connector Instance starts. Each task independently describes its output and dead-letter topics before constructing its producer, so a task restart cannot bypass the pre-created-topic check. Kafka 4.2 producers do not support `allow.auto.create.topics` (that setting belongs to consumers), so no producer property can disable creation. There is necessarily a race if a topic is deleted after the Admin check but before a producer metadata request. To guarantee that this race cannot recreate a topic, disable broker-side topic auto-creation (or its managed-platform equivalent) and do not grant the connector principal topic-creation privileges.
+## Destination Policies
+
+A literal `output.topic`, such as `jev-output`, retains the fixed-topic behavior. To route
+from one typed Jev answer, use exactly one of these Routing Expressions with optional
+literal text before and after it:
+
+```text
+jev-${answers.department.choice}
+risk-${answers.urgency.level}
+queue-${answers.needs_attention.noul >= 0.7; "human", "automatic"}
+priority-${answers.urgency.score > 1.5; "high", "normal"}
+```
+
+Choice routing inserts one configured Choice criterion key. Score Level routing inserts
+the zero-based level having the greatest returned probability; a tie selects the higher
+level. Noul Probability and Score Value routing support `>`, `>=`, `<`, and `<=`, followed
+by `;` and two JSON-quoted literal fragments for the true and false branches. Either
+fragment may be empty when both completed topic names remain valid. Continuous Noul and
+Score values cannot be interpolated directly.
+
+The referenced question must exist in `jev.questions`, its name must match
+`[A-Za-z_][A-Za-z0-9_-]*`, and its type must match the selector. The connector rejects
+multiple replacements, arbitrary JSON paths, Choice conditionals, equality operators,
+compound expressions, nesting, arithmetic, functions, unreachable numeric branches, and
+invalid rendered topic names.
+
+At startup, the connector derives the complete finite candidate set: every Choice key,
+every Score Level, or both numeric branches. Connector and task startup describe all
+candidate destinations before processing. A missing or malformed referenced answer at
+runtime is a Routing Contract Violation: the task fails, publishes neither an Enriched
+Record nor a Dead-Letter Record, and leaves the batch uncommitted. Answers unrelated to
+the policy remain opaque and are preserved unchanged.
+
+The connector uses the Kafka Admin API to describe every configured input, every possible Destination Topic, and the dead-letter topic when the Connector Instance starts. Each task independently describes all destinations and the dead-letter topic before constructing its producer, so a task restart cannot bypass the pre-created-topic check. Kafka 4.2 producers do not support `allow.auto.create.topics` (that setting belongs to consumers), so no producer property can disable creation. There is necessarily a race if a topic is deleted after the Admin check but before a producer metadata request. To guarantee that this race cannot recreate a topic, disable broker-side topic auto-creation (or its managed-platform equivalent) and do not grant the connector principal topic-creation privileges.
 
 ## Failure Classification
 
