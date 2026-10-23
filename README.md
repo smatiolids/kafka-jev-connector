@@ -59,7 +59,8 @@ sequenceDiagram
    (`state.mode=FULL_VALUE`) or a text template with only the fields you allow
    (`state.mode=TEMPLATE`).
 3. It sends that state to Jev together with your **Question Set** (`jev.questions`).
-4. On success it publishes an Enriched Record to `output.topic`. On a permanent,
+4. On success it publishes an Enriched Record to the literal or result-selected
+   Destination Topic defined by `output.topic`. On a permanent,
    record-specific error it publishes a sanitized record to `errors.deadletter.topic`.
 5. The input offset is committed only after the result is written.
 
@@ -80,7 +81,7 @@ You need:
 The steps below use Confluent Cloud.
 
 1. **Create the topics.** The connector never creates topics. You need an input topic,
-   an output topic, and a dead-letter topic, all distinct.
+   every possible output topic, and a dead-letter topic, all distinct.
 2. **Upload the plugin.** In Confluent Cloud, go to **Artifacts → Custom connectors**
    and upload the plugin ZIP. Select runtime `4.2` and Java `17`.
 3. **Allow egress** to `api.typesafe.ai:443`.
@@ -212,7 +213,7 @@ About three seconds later, this Enriched Record appears on `message_jev`:
   "connector": {
     "name": "jev-techzone",
     "plugin": "kafka-jev-connector",
-    "version": "1.0.0"
+    "version": "0.2"
   },
   "jev": {
     "model": "jev-1.13.0",
@@ -260,12 +261,125 @@ overall score of `0.08` with confidence `0.92`. The alias `jev-latest` resolved 
 Each Enriched Record also carries two headers, `kafka-jev-evaluation-id` and
 `kafka-jev-resolved-model`, so consumers can route or deduplicate without parsing the body.
 
+## Bounded dynamic routing
+
+By default, `output.topic` is a literal topic name and every successful evaluation goes
+there. To route records directly from a Jev answer, put exactly one Routing Expression in
+`output.topic`. The connector calls this *bounded* routing because it derives every
+possible Destination Topic from the configuration and verifies those topics before it
+consumes records. Model output can never introduce an arbitrary topic.
+
+The supported forms are:
+
+| Answer | `output.topic` example | Possible result |
+| --- | --- | --- |
+| Choice | `support-${answers.department.choice}` | `support-billing`, `support-technical` |
+| Score Level | `risk-${answers.urgency.level}` | `risk-0`, `risk-1`, `risk-2` |
+| Noul Probability | `review-${answers.needs_review.noul >= 0.7; "human", "automatic"}` | `review-human`, `review-automatic` |
+| Score Value | `priority-${answers.urgency.score > 1.5; "high", "normal"}` | `priority-high`, `priority-normal` |
+
+Literal text can appear before and after the expression. Numeric conditions support `>`,
+`>=`, `<`, and `<=`; the first quoted fragment is used when the condition is true and the
+second when it is false.
+
+### Route by Choice
+
+Use a Choice when each configured criterion maps naturally to a topic-name fragment:
+
+```jsonc
+{
+  "output.topic": "support-${answers.department.choice}",
+  "jev.questions": "{\"department\":{\"type\":\"choice\",\"instructions\":\"Which team should handle this?\",\"criteria\":{\"billing\":\"Payment issues\",\"technical\":\"Technical issues\",\"sales\":\"Sales questions\"}}}"
+}
+```
+
+If Jev returns:
+
+```json
+{
+  "answers": {
+    "department": {
+      "type": "choice",
+      "choice": "technical"
+    }
+  }
+}
+```
+
+the connector publishes the Enriched Record to `support-technical`. Before startup,
+create `support-billing`, `support-technical`, and `support-sales`.
+
+### Route by Score Level
+
+A Score Level is the zero-based criterion with the greatest returned probability. If
+multiple levels tie, the higher level wins.
+
+```jsonc
+{
+  "output.topic": "risk-${answers.urgency.level}",
+  "jev.questions": "{\"urgency\":{\"type\":\"score\",\"instructions\":\"How urgent is this?\",\"criteria\":[\"low\",\"medium\",\"high\"]}}"
+}
+```
+
+Probabilities `{"0":0.1,"1":0.2,"2":0.7}` select `risk-2`. Create `risk-0`,
+`risk-1`, and `risk-2` before starting the connector.
+
+### Route by Noul Probability threshold
+
+Use a Noul threshold to select one of two literal fragments:
+
+```jsonc
+{
+  "output.topic": "review-${answers.needs_review.noul >= 0.7; \"human\", \"automatic\"}",
+  "jev.questions": "{\"needs_review\":{\"type\":\"noul\",\"instructions\":\"This message requires human review\"}}"
+}
+```
+
+A returned Noul Probability of `0.82` selects `review-human`; `0.45` selects
+`review-automatic`. Noul values are bounded from `0` through `1`, and configuration fails
+if the threshold makes either branch impossible.
+
+### Route by Score Value threshold
+
+Use the continuous Score Value when the routing boundary may fall between rubric levels:
+
+```jsonc
+{
+  "output.topic": "priority-${answers.urgency.score > 1.5; \"high\", \"normal\"}",
+  "jev.questions": "{\"urgency\":{\"type\":\"score\",\"instructions\":\"How urgent is this?\",\"criteria\":[\"low\",\"medium\",\"high\"]}}"
+}
+```
+
+A Score Value of `1.8` selects `priority-high`; `1.5` selects `priority-normal` because
+the operator is strictly `>`. Direct interpolation of a Score Value is rejected because
+it would create an unbounded set of topics.
+
+### Topic and failure requirements
+
+- Pre-create every possible Destination Topic and grant the connector principal `WRITE`
+  and `DESCRIBE` access to each one.
+- Destination Topics must be valid Kafka topic names and must differ from every input
+  topic and the fixed dead-letter topic.
+- A policy may reference only one configured question and one expression.
+- A missing answer, wrong answer type, invalid Choice, or out-of-range numeric value is a
+  Routing Contract Violation. The task publishes neither success nor dead-letter output
+  and leaves the source offset uncommitted so the record can be retried after correction.
+- Routing changes only the Kafka destination. It does not change the Enriched Record,
+  Evaluation ID, key, headers, timestamp, or partition selection.
+
+See the [configuration reference](docs/configuration.md#destination-policies) for the
+complete grammar and validation rules.
+
 ## Good to know
 
 - **Duplicates are possible.** Delivery is at least once. If downstream effects must
   happen once, deduplicate by `evaluation.id`.
 - **Question Sets are immutable.** When you change `jev.questions`, also change
   `question.set.id` (for example `.../v2`).
+- **Routing is bounded.** `output.topic` may remain literal or contain one Choice, Score
+  Level, Noul threshold, or Score threshold expression. Every possible destination is
+  derived and checked before records are consumed; see the
+  [configuration reference](docs/configuration.md#destination-policies).
 - **Data leaves your cluster.** Evaluation State is sent to TypeSafe AI. Use `TEMPLATE`
   mode to send only approved fields, and review TypeSafe's data-processing terms first.
 - **Secrets stay out of output.** The connector does not log payloads or Evaluation
@@ -274,6 +388,7 @@ Each Enriched Record also carries two headers, `kafka-jev-evaluation-id` and
 ## Documentation
 
 - [SETUP.md](SETUP.md): Confluent Cloud deployment in detail
+- [RELEASE_NOTES.md](RELEASE_NOTES.md): changes and compatibility notes by release
 - [Connector Configuration](docs/configuration.md): every configuration property
 - [Record Contracts](docs/record-contracts.md): Enriched and Dead-Letter Record shapes,
   hashing, and templates

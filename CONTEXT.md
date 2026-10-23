@@ -36,6 +36,42 @@ _Avoid_: Decision, prediction
 The output Kafka record containing source identity, the original key and value, aggregate evaluation provenance, and the complete Inference Result.
 _Avoid_: Result message, processed event
 
+**Routing**:
+The assignment of an Enriched Record to exactly one Destination Topic based on its Inference Result.
+_Avoid_: Fan-out, broadcasting
+
+**Routing Answer**:
+The typed answer from one configured question whose fields are evaluated to select a Destination Topic. A Choice contributes its selected choice, a Noul contributes its probability, and a Score contributes either its numeric value or its derived Score Level.
+_Avoid_: Classification, routing decision
+
+**Noul Probability**:
+A numeric probability expressing how likely the statement in a Noul question is to be true.
+_Avoid_: Boolean, confidence
+
+**Score Value**:
+The numeric rating returned for a Score question against its ordered criteria.
+_Avoid_: Noul Probability, confidence
+
+**Score Level**:
+The zero-based level with the greatest probability in a Score answer. When levels tie for greatest probability, the higher level is selected.
+_Avoid_: Score Value, criteria description
+
+**Destination Topic**:
+The single Kafka topic selected to receive an Enriched Record.
+_Avoid_: Output channel, route
+
+**Destination Policy**:
+The immutable rule that derives one Destination Topic from an Inference Result. It combines literal text with exactly one Routing Expression, and every possible destination must be valid before evaluation begins.
+_Avoid_: Router mode, dynamic topic
+
+**Routing Expression**:
+The single replacement in a Destination Policy. It yields a selected Choice, a Score Level, or one fragment selected by a numeric Noul or Score comparison.
+_Avoid_: Placeholder, script
+
+**Routing Contract Violation**:
+An Inference Result that cannot satisfy the Destination Policy because a referenced answer is absent, has an unexpected type, or contains an invalid referenced value. It stops processing rather than becoming a Dead-Letter Record because it violates the connector's configured evaluation contract.
+_Avoid_: Failed Evaluation, unroutable record
+
 **Source ID**:
 A deterministic identity derived from a Source Record's topic, partition, and offset. It remains stable whenever that Source Record is replayed.
 _Avoid_: Message ID, event ID
@@ -53,5 +89,5 @@ A sanitized record describing a permanent record-specific Failed Evaluation whil
 _Avoid_: Error message
 
 **Connector Instance**:
-A configured deployment of the plugin with a fixed Question Set, state-building policy, input topics, output topic, and dead-letter topic.
+A configured deployment of the plugin with a fixed Question Set, state-building policy, Destination Policy, input topics, and dead-letter topic.
 _Avoid_: Connector, worker

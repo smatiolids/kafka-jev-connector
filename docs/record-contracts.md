@@ -43,7 +43,7 @@ An Enriched Record retains the canonicalized Source Record key and value, evalua
   "connector": {
     "name": "production-fraud-screening",
     "plugin": "kafka-jev-connector",
-    "version": "0.1"
+    "version": "0.2"
   },
   "jev": {
     "model": "jev-1.13.0",
@@ -56,6 +56,13 @@ An Enriched Record retains the canonicalized Source Record key and value, evalua
 The Kafka record timestamp preserves the source timestamp. The Kafka key defaults to the canonicalized original key; configuring Evaluation ID as the key is opt-in. Input headers are not copied by default. When `output.headers.mode=COPY`, byte headers retain their bytes, string headers use UTF-8, null headers remain null, and other Connect values use their canonical JSON representation encoded as UTF-8.
 
 Every Enriched Record has two connector-owned UTF-8 provenance headers regardless of input-header copy mode: `kafka-jev-evaluation-id` contains the Evaluation ID and `kafka-jev-resolved-model` contains the resolved model. Copied input headers are added first, so a colliding connector-owned header is always appended last and remains authoritative through Kafka's `lastHeader` lookup.
+
+When `output.topic` is a Destination Policy, the connector interprets only its referenced
+Routing Answer and selects exactly one prevalidated Destination Topic. Routing does not
+add fields or headers, change the Evaluation ID, alter key or timestamp selection, or set
+an output partition. A replay after a policy change therefore retains its Evaluation ID
+even if it is delivered to a different topic. A Routing Contract Violation produces no
+record, does not enter the dead-letter topic, and leaves the source offset uncommitted.
 
 ## Dead-Letter Record
 
@@ -100,7 +107,7 @@ A Dead-Letter Record describes a permanent record-specific Failed Evaluation. It
   "connector": {
     "name": "production-fraud-screening",
     "plugin": "kafka-jev-connector",
-    "version": "0.1"
+    "version": "0.2"
   }
 }
 ```

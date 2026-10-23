@@ -33,7 +33,13 @@ class Handler(BaseHTTPRequestHandler):
                 200,
                 {
                     "model": "jev-test-1",
-                    "answers": {"department": "technical"},
+                    "answers": {
+                        "department": {
+                            "type": "choice",
+                            "choice": "technical",
+                            "confidence": 1.0,
+                        }
+                    },
                     "usage": {"input_tokens": 7, "output_tokens": 1},
                     "fake": {"deterministic": True},
                 },

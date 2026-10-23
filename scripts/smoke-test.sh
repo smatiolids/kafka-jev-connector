@@ -76,7 +76,7 @@ $compose down --volumes --remove-orphans >/dev/null 2>&1 || true
 $compose up --build -d
 wait_for_connect
 
-for topic in jev-input jev-output jev-dlq; do
+for topic in jev-input jev-billing jev-technical jev-sales jev-dlq; do
   $compose exec -T kafka /opt/kafka/bin/kafka-topics.sh \
     --bootstrap-server kafka:9092 --create --if-not-exists \
     --partitions 1 --replication-factor 1 --topic "$topic" >/dev/null
@@ -86,21 +86,21 @@ curl --fail --silent --show-error -X POST "http://localhost:${connect_port}/conn
   -H 'Content-Type: application/json' --data @config/local-connector.json >/dev/null
 wait_for_task_state RUNNING
 
-produce 'customer-42|{"message":"happy-source-secret"}'
-enriched=$(consume_one jev-output)
+produce 'customer-42|{"tweet_id":"1","author_id":"42","inbound":true,"created_at":"2026-10-23T12:00:00Z","text":"happy-source-secret"}'
+enriched=$(consume_one jev-technical)
 python3 -c '
 import json,sys
 d=json.loads(sys.argv[1])
 assert d["source"]["topic"] == "jev-input"
 assert d["source"]["key"] == "customer-42"
-assert d["input"] == {"message":"happy-source-secret"}
+assert d["input"] == {"tweet_id":"1","author_id":"42","inbound":True,"created_at":"2026-10-23T12:00:00Z","text":"happy-source-secret"}
 assert d["evaluation"]["question_set"]["id"] == "support-routing/local-v1"
 assert d["evaluation"]["model"] == {"requested":"jev-test-1","resolved":"jev-test-1"}
-assert d["jev"] == {"model":"jev-test-1","answers":{"department":"technical"},"usage":{"input_tokens":7,"output_tokens":1},"fake":{"deterministic":True}}
+assert d["jev"] == {"model":"jev-test-1","answers":{"department":{"type":"choice","choice":"technical","confidence":1.0}},"usage":{"input_tokens":7,"output_tokens":1},"fake":{"deterministic":True}}
 ' "$enriched" || fail "Enriched Record did not satisfy the v1 contract"
 echo ENRICHED_RECORD_OK
 
-produce 'customer-43|{"message":"CONTROL_PERMANENT"}'
+produce 'customer-43|{"tweet_id":"2","author_id":"43","inbound":true,"created_at":"2026-10-23T12:01:00Z","text":"CONTROL_PERMANENT"}'
 dead_letter=$(consume_one jev-dlq)
 python3 -c '
 import json,sys
@@ -116,7 +116,7 @@ echo SANITIZED_DEAD_LETTER_OK
 
 wait_for_committed_offset 2
 before=$(committed_offset)
-produce 'customer-44|{"message":"CONTROL_TRANSIENT"}'
+produce 'customer-44|{"tweet_id":"3","author_id":"44","inbound":true,"created_at":"2026-10-23T12:02:00Z","text":"CONTROL_TRANSIENT"}'
 wait_for_task_state FAILED
 sleep 2
 after=$(committed_offset)
