@@ -32,25 +32,37 @@ sequenceDiagram
     autonumber
     participant P as Producer
     participant IN as Input topic
-    participant C as Jev connector
-    participant J as TypeSafe Jev API
-    participant OUT as Output topic
-    participant DLQ as Dead-letter topic
+    participant C as JEV Connector
+    participant J as TypeSafe JEV API
+    participant OUT_A as Output topic A
+    participant OUT_B as Output topic B
+    participant DLQ as Dead-letter topic (DLQ)
 
-    P->>IN: JSON message, e.g. text to classify
-    IN->>C: Kafka Connect delivers record
-    C->>C: Build Evaluation State (FULL_VALUE or TEMPLATE)<br/>and compute Source ID and Evaluation ID
-    C->>J: POST state + Question Set + model
-    alt Jev answers
-        J-->>C: answers, resolved model, token usage
-        C->>OUT: Enriched Record (source + input + evaluation + jev)
-        C->>IN: Commit offset
-    else Permanent record failure (missing template field, 413)
-        C->>DLQ: Sanitized Dead-Letter Record
-        C->>IN: Commit offset
-    else Transient failure (timeouts, 429, 5xx)
-        C->>J: Retry with backoff
-        Note over C: If retries run out, the task stops and the<br/>offset stays uncommitted, so nothing is lost
+    Note over C,OUT_B: Before startup, the connector validates the finite set<br/>of topics that the policy may select
+    Note over C,OUT_B: output.topic may be fixed or use an expression based on<br/>Choice, a Noul or Score threshold, or a Score level
+    P->>IN: JSON message, such as text to classify
+    IN->>C: Kafka Connect delivers the record
+    C->>C: Builds Evaluation State (FULL_VALUE or TEMPLATE)<br/>and calculates source and evaluation identifiers
+    C->>J: Sends state, Question Set, and model
+    alt JEV returns answers
+        J-->>C: Answers, resolved model, and token usage
+        C->>C: Resolves the policy and selects exactly<br/>one destination topic
+        alt The policy selects topic A
+            C->>OUT_A: Publishes the Enriched Record
+        else The policy selects topic B
+            C->>OUT_B: Publishes the Enriched Record
+        end
+        Note over C,OUT_B: One evaluation produces one publication,<br/>with no fan-out to multiple topics
+        C->>IN: Commits the offset
+    else Routing contract violation
+        J-->>C: Response incompatible with the destination policy
+        Note over C: Stops the task, does not send to the DLQ, and leaves<br/>the offset uncommitted so the record can be retried
+    else Permanent record failure (missing template field or HTTP 413)
+        C->>DLQ: Publishes a sanitized failure record
+        C->>IN: Commits the offset
+    else Transient failure (timeout, HTTP 429, or HTTP 5xx)
+        C->>J: Retries with progressive backoff
+        Note over C: If retries are exhausted, the task stops and the<br/>offset remains uncommitted, preventing data loss
     end
 ```
 
@@ -261,7 +273,7 @@ overall score of `0.08` with confidence `0.92`. The alias `jev-latest` resolved 
 Each Enriched Record also carries two headers, `kafka-jev-evaluation-id` and
 `kafka-jev-resolved-model`, so consumers can route or deduplicate without parsing the body.
 
-## Bounded dynamic routing
+## Routing options
 
 By default, `output.topic` is a literal topic name and every successful evaluation goes
 there. To route records directly from a Jev answer, put exactly one Routing Expression in
@@ -269,18 +281,20 @@ there. To route records directly from a Jev answer, put exactly one Routing Expr
 possible Destination Topic from the configuration and verifies those topics before it
 consumes records. Model output can never introduce an arbitrary topic.
 
-The supported forms are:
+Choose one of these `output.topic` forms:
 
-| Answer | `output.topic` example | Possible result |
+| Option | `output.topic` example | Candidate Destination Topics |
 | --- | --- | --- |
+| Fixed topic | `support-all` | `support-all` |
 | Choice | `support-${answers.department.choice}` | `support-billing`, `support-technical` |
 | Score Level | `risk-${answers.urgency.level}` | `risk-0`, `risk-1`, `risk-2` |
 | Noul Probability | `review-${answers.needs_review.noul >= 0.7; "human", "automatic"}` | `review-human`, `review-automatic` |
 | Score Value | `priority-${answers.urgency.score > 1.5; "high", "normal"}` | `priority-high`, `priority-normal` |
 
-Literal text can appear before and after the expression. Numeric conditions support `>`,
-`>=`, `<`, and `<=`; the first quoted fragment is used when the condition is true and the
-second when it is false.
+A fixed topic needs no Routing Expression and preserves the original connector behavior.
+For the four result-driven options, literal text can appear before and after the
+expression. Numeric conditions support `>`, `>=`, `<`, and `<=`; the first quoted
+fragment is used when the condition is true and the second when it is false.
 
 ### Route by Choice
 
